@@ -1,0 +1,48 @@
+**News**
+- `Tin mới về NVDA`
+- `
+`
+- `Có tin gì mới về MSFT không?`
+- `Tóm tắt các tin mới ảnh hưởng tới cổ phiếu TSLA`
+
+**Text2SQL**
+- `So sánh close price của AAPL và MSFT trong 30 ngày gần nhất`
+- `% tăng/giảm 30 ngày của AAPL và MSFT`
+- `Cổ phiếu nào có market cap cao nhất trong database?`
+- `Cho tôi giá đóng cửa mới nhất của AAPL, MSFT, NVDA`
+
+**Chat Context / Follow-up**
+- Câu 1: `So sánh close price của AAPL và MSFT trong 30 ngày gần nhất`
+- Câu 2: `so sánh với NVDA nữa cho tôi`
+- Câu 3: `% tăng/giảm 30 ngày của 2 mã trên`
+- Câu 4: `vẽ biểu đồ normalized price cho các mã đó`
+
+**Visualization**
+- `Vẽ biểu đồ close price của AAPL và MSFT trong 30 ngày gần nhất`
+- `Vẽ chart so sánh giá đóng cửa AAPL, MSFT, NVDA trong 60 ngày gần nhất`
+- `Hiển thị biểu đồ volume của NVDA trong 30 ngày gần nhất`
+- `Vẽ biểu đồ market cap của AAPL MSFT NVDA`
+
+**Simple Finance / Quote**
+- `Giá hiện tại của AAPL`
+- `Giá nhanh của AAPL MSFT NVDA`
+- `Quote cho TSLA`
+- `Market cap hiện tại của MSFT`
+
+**Ingestion**
+- `Sync dữ liệu AAPL MSFT NVDA`
+- `Cập nhật dữ liệu TSLA trong 1y`
+- `Ingest AAPL trong 6mo`
+- `Tải dữ liệu MSFT NVDA 2y`
+
+**Thinking Trace**
+- `Tin mới về NVDA`
+- `Giá hiện tại của AAPL`
+- `Vẽ biểu đồ close price của AAPL và MSFT trong 30 ngày gần nhất`
+- `% tăng/giảm 30 ngày của AAPL và MSFT`
+
+**Router / Intent**
+- `tin mới về NVDA`
+- `giá hiện tại của AAPL`
+- `vẽ biểu đồ close price của MSFT`
+- `cập nhật dữ liệu AAPL MSFT`

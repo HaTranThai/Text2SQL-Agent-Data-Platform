@@ -1,0 +1,41 @@
+[project]
+name = "fintextsql"
+version = "0.1.0"
+description = "Finance-focused Text-to-SQL assistant with FastAPI, Postgres, and React."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "pydantic>=2.8.0",
+  "pydantic-settings>=2.4.0",
+  "SQLAlchemy>=2.0.30",
+  "psycopg[binary]>=3.2.0",
+  "httpx>=0.27.0",
+  "pandas>=2.2.0",
+  "yfinance>=0.2.40",
+  "feedparser>=6.0.11",
+  "sqlglot>=25.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2.0",
+  "ruff>=0.6.0",
+]
+
+[build-system]
+requires = ["setuptools>=70.0.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
