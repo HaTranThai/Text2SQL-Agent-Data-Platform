@@ -7,7 +7,7 @@ export default defineConfig({
     host: '0.0.0.0',
     port: 5173,
     allowedHosts: [
-      'data-platform.mrworld.io.vn'
+      'data-platform.mrworld.id.vn'
     ],
     proxy: {
       '/api': {

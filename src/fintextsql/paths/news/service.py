@@ -64,7 +64,8 @@ class NewsService:
                                     "or facts not present in the articles. Translate article titles into Vietnamese "
                                     "when you mention them. When mentioning a specific article, write the Vietnamese "
                                     "title as plain text, then put a short Markdown source link immediately after it. "
-                                    "Be concise but analytical."
+                                    "Do not use generic filler like 'Tin từ ...: nhu cầu AI và triển vọng ngành'. "
+                                    "Be concise, specific, and analytical."
                                 ),
                             ),
                             LLMMessage(
@@ -79,8 +80,9 @@ class NewsService:
                                             "Write an answer with: 1) short overview, 2) key themes, "
                                             "3) likely implications for the ticker/topic, 4) caveats. "
                                             "Mention the most relevant publishers briefly. Do not output English "
-                                            "headlines verbatim; translate them into Vietnamese first. In the key "
-                                            "article list, use this format: Vietnamese title [Source](article URL)."
+                                            "headlines verbatim; translate them into Vietnamese first. Avoid repeating "
+                                            "the same sentence structure across articles. In the key article list, use "
+                                            "this format: Vietnamese title [Publisher](article URL) - one specific takeaway."
                                         ),
                                     ]
                                 ),
@@ -226,12 +228,20 @@ def _dedupe_articles(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
     deduped: list[dict[str, Any]] = []
     seen: set[str] = set()
     for article in articles:
-        key = str(article.get("link") or article.get("title") or "").strip()
-        if not key or key in seen:
+        link_key = str(article.get("link") or "").strip().lower()
+        title_key = _canonical_title(str(article.get("title") or ""))
+        keys = {key for key in [link_key, title_key] if key}
+        if not keys or seen.intersection(keys):
             continue
-        seen.add(key)
+        seen.update(keys)
         deduped.append(article)
     return deduped
+
+
+def _canonical_title(title: str) -> str:
+    normalized = re.sub(r"\s+-\s+[^-]{2,80}$", "", title.strip().lower())
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return " ".join(normalized.split())
 
 
 def _filter_relevant_articles(articles: list[dict[str, Any]], *, ticker: str | None) -> list[dict[str, Any]]:
@@ -243,7 +253,39 @@ def _filter_relevant_articles(articles: list[dict[str, Any]], *, ticker: str | N
         for article in articles
         if any(alias in _article_text(article) for alias in aliases)
     ]
-    return relevant if len(relevant) >= 3 else articles
+    relevant = sorted(relevant, key=lambda article: _article_relevance_score(article, ticker=ticker), reverse=True)
+    if len(relevant) >= 2:
+        return relevant
+    if relevant:
+        indirect = [article for article in articles if article not in relevant]
+        return [*relevant, *indirect[:2]]
+    return articles
+
+
+def _article_relevance_score(article: dict[str, Any], *, ticker: str) -> int:
+    text = _article_text(article)
+    score = 0
+    for alias in _ticker_aliases(ticker):
+        if alias in text:
+            score += 5
+    direct_terms = [
+        "stock",
+        "shares",
+        "price target",
+        "rating",
+        "valuation",
+        "earnings",
+        "revenue",
+        "profit",
+        "ceo",
+        "guidance",
+        "analyst",
+        ticker.lower(),
+    ]
+    score += sum(3 for term in direct_terms if term in text)
+    indirect_terms = ["marketplace", "digital markets act", "ios", "app store", "supplier", "partner"]
+    score += sum(1 for term in indirect_terms if term in text)
+    return score
 
 
 def _ticker_aliases(ticker: str) -> set[str]:
@@ -285,21 +327,21 @@ def _fallback_news_analysis(*, ticker: str | None, articles: list[dict[str, Any]
     subject = ticker or "thị trường"
     themes = _theme_counts(articles)
     top_publishers = _top_values([str(article.get("publisher") or article.get("source") or "") for article in articles])
-    top_articles = [_article_bullet(article, ticker=ticker) for article in articles[:4] if article.get("title")]
+    selected_articles = _select_articles_for_brief(articles, ticker=ticker, limit=4)
 
     lines = [
-        f"Mình lấy được {len(articles)} tin gần đây về {subject}. Nhìn nhanh, các tin đang xoay quanh "
+        f"Mình tìm thấy {len(articles)} tin gần đây về {subject}. Chủ đề nổi bật là "
         f"{_format_themes(themes)}.",
         "",
-        "### Điểm chính",
+        "### Tin đáng chú ý",
     ]
-    for article_line in top_articles:
-        lines.append(f"- {article_line}")
+    for article in selected_articles:
+        lines.append(f"- {_article_bullet(article, ticker=ticker)}")
 
     lines.extend(
         [
             "",
-            "### Diễn giải",
+            "### Nhận định",
             _fallback_implication(subject, themes),
             "",
             "### Lưu ý",
@@ -307,9 +349,22 @@ def _fallback_news_analysis(*, ticker: str | None, articles: list[dict[str, Any]
             "- Nên đối chiếu thêm báo cáo tài chính, diễn biến giá và tin chính thức của công ty trước khi ra quyết định.",
         ]
     )
-    if top_publishers:
-        lines.append(f"- Nguồn nổi bật: {', '.join(top_publishers)}.")
+    source_labels = _unique_source_labels(top_publishers)
+    if source_labels:
+        lines.append(f"- Nguồn nổi bật: {', '.join(source_labels)}.")
     return "\n".join(lines)
+
+
+def _select_articles_for_brief(
+    articles: list[dict[str, Any]], *, ticker: str | None, limit: int
+) -> list[dict[str, Any]]:
+    if not ticker:
+        return articles[:limit]
+    aliases = _ticker_aliases(ticker)
+    direct = [article for article in articles if any(alias in _article_text(article) for alias in aliases)]
+    indirect = [article for article in articles if article not in direct]
+    # Keep at most one sector-level article in a ticker answer so the response does not sound padded.
+    return [*direct[:limit], *indirect[: max(0, min(1, limit - len(direct)))]] or articles[:limit]
 
 
 def _translate_headline(headline: str) -> str:
@@ -350,6 +405,18 @@ def _translate_headline(headline: str) -> str:
         ),
         "Elon Musk Left For China With Trump During OpenAI Trial Despite Judge's 'Recall Status' Order: Report": (
             "Elon Musk sang Trung Quốc cùng ông Trump trong lúc phiên tòa OpenAI vẫn có yêu cầu từ thẩm phán"
+        ),
+        "Evercore ISI Hikes Apple Price Target to $365: Bull Case Now $500 on Services Compounding": (
+            "Evercore ISI nâng mục tiêu giá Apple lên 365 USD, kịch bản tích cực là 500 USD nhờ mảng dịch vụ"
+        ),
+        "KeyBanc turns ’more cautious’ on Apple stock amid ’stretched’ valuation": (
+            "KeyBanc thận trọng hơn với cổ phiếu Apple vì định giá bị cho là căng"
+        ),
+        "Apple Names New CEO as Tim Cook to Step Down in September": (
+            "Apple bổ nhiệm CEO mới khi Tim Cook dự kiến rời vị trí vào tháng 9"
+        ),
+        "Xsolla and Skich Announce Strategic Partnership to Bring Merchant of Record Payments to an Alternative Mobile Game Marketplace": (
+            "Xsolla và Skich hợp tác thanh toán cho marketplace game thay thế trên iOS"
         ),
     }
     if headline in exact:
@@ -404,14 +471,29 @@ def _translated_article_headline(article: dict[str, Any]) -> str:
 def _translated_article_reference(article: dict[str, Any]) -> str:
     headline = _translated_article_headline(article)
     link = str(article.get("link") or "").strip()
-    if not link:
-        return headline
     source = str(article.get("publisher") or article.get("source") or "Nguồn").strip()
-    return f"{headline} [{_source_link_label(source)}]({link})"
+    label = _source_link_label(source)
+    if not link:
+        return f"**{headline}** ({label})"
+    return f"**{headline}** [{label}]({link})"
 
 
 def _article_bullet(article: dict[str, Any], *, ticker: str | None) -> str:
-    return f"{_translated_article_reference(article)}: {_article_vi_description(article, ticker=ticker)}"
+    date_text = _article_date_label(article)
+    date_suffix = f", {date_text}" if date_text else ""
+    return f"{_translated_article_reference(article)}{date_suffix}. {_article_vi_description(article, ticker=ticker)}"
+
+
+def _article_date_label(article: dict[str, Any]) -> str:
+    value = article.get("published_at")
+    if isinstance(value, datetime):
+        return value.strftime("%d/%m/%Y")
+    if isinstance(value, str) and value[:10]:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%d/%m/%Y")
+        except ValueError:
+            return ""
+    return ""
 
 
 def _article_vi_description(article: dict[str, Any], *, ticker: str | None) -> str:
@@ -420,17 +502,37 @@ def _article_vi_description(article: dict[str, Any], *, ticker: str | None) -> s
     text = f"{title} {summary}".lower()
     prefix = ""
     if ticker and not any(alias in text for alias in _ticker_aliases(ticker)):
-        prefix = f"Tin này không nhắc trực tiếp tới {ticker}, nhưng có thể ảnh hưởng tới sentiment ngành. "
+        prefix = f"Không nhắc trực tiếp {ticker}, nên chỉ nên xem như tín hiệu ngành. "
 
     if "running rings around nvidia" in text or ("ai stock" in text and "nvidia" in text):
         return (
             prefix
-            + "Bài viết so sánh một cổ phiếu AI khác với Nvidia, hàm ý nhà đầu tư đang tìm kiếm các lựa chọn hưởng lợi từ làn sóng AI ngoài nhóm dẫn đầu quen thuộc."
+            + "Bài viết so sánh một cổ phiếu AI khác với Nvidia, cho thấy dòng tiền vẫn đang tìm kiếm các lựa chọn hưởng lợi từ làn sóng AI ngoài nhóm dẫn đầu."
         )
     if "desantis" in text and "tesla" in text:
         return (
             prefix
             + "Bài viết nói về việc Ron DeSantis khen chất lượng sản phẩm của Tesla nhưng vẫn phản đối các chính sách bắt buộc xe điện, nên tác động chính nằm ở câu chuyện chính sách EV và hình ảnh thương hiệu Tesla."
+        )
+    if "evercore" in text and "apple" in text and "price target" in text:
+        return (
+            prefix
+            + "Tác động thiên về tích cực: Evercore nâng mục tiêu giá và nhấn mạnh luận điểm tăng trưởng từ mảng dịch vụ, có thể hỗ trợ kỳ vọng định giá ngắn hạn."
+        )
+    if "keybanc" in text and "apple" in text and ("cautious" in text or "stretched" in text):
+        return (
+            prefix
+            + "Tác động thiên về tiêu cực/thận trọng: KeyBanc lo ngại định giá Apple đã căng và nhu cầu phần cứng tại Mỹ có dấu hiệu bình thường hóa."
+        )
+    if "apple names new ceo" in text or ("tim cook" in text and "step down" in text):
+        return (
+            prefix
+            + "Đây là tin quản trị rất nhạy với sentiment: thay đổi CEO có thể tạo biến động ngắn hạn, dù cần xác nhận thêm từ nguồn chính thức của Apple."
+        )
+    if "xsolla" in text and "skich" in text and ("ios" in text or "digital markets act" in text):
+        return (
+            prefix
+            + "Tác động gián tiếp: tin liên quan hệ sinh thái iOS tại EU và cạnh tranh App Store, có thể ảnh hưởng câu chuyện doanh thu dịch vụ hơn là giá cổ phiếu ngay lập tức."
         )
     if "china's view on elon musk" in text or ("elon musk" in text and "visionary" in text):
         return (
@@ -457,6 +559,11 @@ def _article_vi_description(article: dict[str, Any], *, ticker: str | None) -> s
             prefix
             + "Tin nói về lợi nhuận Foxconn tăng vượt dự báo nhờ nhu cầu AI, qua đó phản ánh nhu cầu hạ tầng và phần cứng AI vẫn mạnh trong chuỗi cung ứng công nghệ."
         )
+    if "winning streak" in text or "gapped higher" in text:
+        return (
+            prefix
+            + "Tin phản ánh phản ứng tích cực của cổ phiếu trước kỳ vọng đơn hàng chip AI từ Trung Quốc, nhưng vẫn phụ thuộc vào phê duyệt chính sách."
+        )
     if "h200" in text or ("chip" in text and "china" in text):
         return (
             prefix
@@ -465,32 +572,32 @@ def _article_vi_description(article: dict[str, Any], *, ticker: str | None) -> s
     if any(keyword in text for keyword in ["quote", "price", "forecast"]):
         return (
             prefix
-            + "Bài viết tập trung vào giá cổ phiếu và dự báo, phù hợp để tham khảo sentiment thị trường nhưng cần đối chiếu với dữ liệu giá và báo cáo tài chính."
+            + "Trọng tâm là giá cổ phiếu và dự báo, hữu ích để đọc sentiment ngắn hạn nhưng chưa đủ để kết luận về nền tảng kinh doanh."
         )
     if any(keyword in text for keyword in ["partnership", "deployment", "infrastructure", "gigawatts"]):
         return (
             prefix
-            + "Tin nói về hợp tác hoặc triển khai hạ tầng AI, thường phản ánh kế hoạch mở rộng năng lực tính toán và nhu cầu đầu tư dài hạn."
+            + "Nội dung về hợp tác hoặc triển khai hạ tầng AI, thường là tín hiệu tích cực cho nhu cầu tính toán và đầu tư dài hạn."
         )
     if any(keyword in text for keyword in ["discount", "paid", "buy", "options"]):
         return (
             prefix
-            + "Nội dung có thiên hướng chiến lược giao dịch hoặc quyền chọn, nên xem là góc nhìn tham khảo về cách tiếp cận rủi ro/lợi nhuận hơn là tín hiệu cơ bản trực tiếp."
-        )
-    if any(keyword in text for keyword in ["earnings", "profit", "revenue", "q1", "quarter"]):
-        return (
-            prefix
-            + "Bài viết liên quan tới kết quả kinh doanh, doanh thu hoặc lợi nhuận; đây là nhóm tin có thể ảnh hưởng trực tiếp tới kỳ vọng ngắn hạn của thị trường."
-        )
-    if any(keyword in text for keyword in ["valuation", "cheap", "expensive", "market cap"]):
-        return (
-            prefix
-            + "Tin tập trung vào định giá cổ phiếu, thường dựa trên giả định tăng trưởng và lợi nhuận tương lai nên cần đọc kỹ luận điểm phía sau."
+            + "Đây là góc nhìn chiến lược giao dịch/quyền chọn, phù hợp để tham khảo cách quản trị rủi ro hơn là tín hiệu cơ bản trực tiếp."
         )
     if _has_ai_term(text):
         return (
             prefix
-            + "Bài viết xoay quanh nhu cầu AI hoặc triển vọng ngành công nghệ, có thể tác động tới nhóm cổ phiếu hưởng lợi từ hạ tầng AI."
+            + "Tin củng cố bức tranh nhu cầu AI, qua đó có thể ảnh hưởng tới kỳ vọng với nhóm phần cứng và hạ tầng công nghệ."
+        )
+    if any(keyword in text for keyword in ["earnings", "profit", "revenue", "q1", "quarter"]):
+        return (
+            prefix
+            + "Nhóm tin về doanh thu, lợi nhuận hoặc kỳ vọng quý thường có tác động trực tiếp tới phản ứng ngắn hạn của thị trường."
+        )
+    if any(keyword in text for keyword in ["valuation", "cheap", "expensive", "market cap"]):
+        return (
+            prefix
+            + "Luận điểm chính nằm ở định giá; cần đọc kỹ các giả định về tăng trưởng, biên lợi nhuận và mức chiết khấu."
         )
     if summary:
         return prefix + _compact_summary(summary)
@@ -507,11 +614,29 @@ def _compact_summary(summary: str) -> str:
 def _source_link_label(source: str) -> str:
     source = source.replace("[", "").replace("]", "").strip()
     source = re.sub(r"\s+", " ", source)
+    source_labels = {
+        "yahoo_finance_rss": "Yahoo Finance",
+        "google_news_rss": "Google News",
+    }
+    if source in source_labels:
+        return source_labels[source]
     if not source or source.endswith("_rss"):
         return "Nguồn"
     if len(source) > 18:
         return f"{source[:16].rstrip()}..."
     return source
+
+
+def _unique_source_labels(sources: list[str]) -> list[str]:
+    labels: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        label = _source_link_label(source)
+        if label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+    return labels
 
 
 def _looks_untranslated_english(value: str) -> bool:
@@ -523,8 +648,29 @@ def _looks_untranslated_english(value: str) -> bool:
 
 def _headline_vi_summary(title: str, publisher: str) -> str:
     text = title.lower()
+    publisher_label = _source_link_label(publisher)
     if "desantis" in text and "tesla" in text:
         return "Ron DeSantis khen xe Tesla nhưng vẫn phản đối ý tưởng xe điện sẽ cứu thế giới"
+    if "evercore" in text and "apple" in text and "price target" in text:
+        return "Evercore nâng mục tiêu giá Apple nhờ kỳ vọng tăng trưởng dịch vụ"
+    if "keybanc" in text and "apple" in text and ("cautious" in text or "stretched" in text):
+        return "KeyBanc thận trọng hơn với Apple vì lo ngại định giá"
+    if "apple names new ceo" in text or ("tim cook" in text and "step down" in text):
+        return "Apple thay đổi CEO, yếu tố có thể tác động tới sentiment"
+    if "xsolla" in text and "skich" in text:
+        return "Marketplace game thay thế trên iOS có thêm đối tác thanh toán"
+    if "nvidia wins" in text and "america loses" in text:
+        return "Nvidia hưởng lợi nhưng chính sách chip gây tranh luận tại Mỹ"
+    if "nvidia stock extends winning streak" in text and "china" in text:
+        return "Cổ phiếu Nvidia kéo dài đà tăng nhờ kỳ vọng từ thị trường Trung Quốc"
+    if "ai rally pushes" in text and "s&p 500" in text:
+        return "Đà tăng nhóm AI kéo S&P 500 tiến gần vùng đỉnh mới"
+    if "nvidia stock looks cheap" in text:
+        return "Cổ phiếu Nvidia được nhìn nhận là còn rẻ trước kỳ báo cáo quan trọng"
+    if "ai demand" in text and ("profit" in text or "profits" in text):
+        return "Nhu cầu AI hỗ trợ lợi nhuận của các doanh nghiệp trong chuỗi cung ứng"
+    if "ai demand" in text:
+        return "Nhu cầu AI tiếp tục là điểm tựa cho nhóm hạ tầng công nghệ"
     if "china" in text and "elon musk" in text and "visionary" in text:
         return "Trung Quốc nhìn Elon Musk như một nhà viễn kiến nhưng cũng là nhân vật gây tranh cãi"
     if "newsom" in text and ("ev incentive" in text or "rebate" in text):
@@ -537,17 +683,26 @@ def _headline_vi_summary(title: str, publisher: str) -> str:
         topic = "hợp tác chiến lược và triển khai hạ tầng AI"
     elif any(keyword in text for keyword in ["discount", "paid", "buy", "options"]):
         topic = "chiến lược mua cổ phiếu/quyền chọn với mức chiết khấu"
-    elif any(keyword in text for keyword in ["earnings", "profit", "revenue", "q1", "quarter"]):
-        topic = "kết quả kinh doanh và kỳ vọng lợi nhuận"
     elif any(keyword in text for keyword in ["h200", "chip", "export"]):
         topic = "chip AI, Trung Quốc và chính sách xuất khẩu"
+    elif any(keyword in text for keyword in ["earnings", "profit", "revenue", "q1", "quarter"]):
+        topic = "kết quả kinh doanh và kỳ vọng lợi nhuận"
     elif any(keyword in text for keyword in ["valuation", "cheap", "expensive", "market cap"]):
         topic = "định giá cổ phiếu"
     elif _has_ai_term(text):
         topic = "nhu cầu AI và triển vọng ngành"
     else:
         topic = "cập nhật mới liên quan đến doanh nghiệp và thị trường"
-    return f"Tin từ {publisher}: {topic}"
+    topic = _sentence_case_vi(topic)
+    if publisher_label in {"Yahoo Finance", "Google News", "Nguồn"}:
+        return topic
+    return f"{topic} theo {publisher_label}"
+
+
+def _sentence_case_vi(value: str) -> str:
+    if not value:
+        return value
+    return value[0].upper() + value[1:]
 
 
 def _theme_counts(articles: list[dict[str, Any]]) -> dict[str, int]:

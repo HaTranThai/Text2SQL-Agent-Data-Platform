@@ -4,7 +4,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-IntentName = Literal["text_to_sql", "visualization", "news", "ingestion", "simple_finance"]
+IntentName = Literal["general", "text_to_sql", "visualization", "news", "ingestion", "simple_finance"]
 
 
 class ChatRequest(BaseModel):
@@ -28,6 +28,18 @@ class ChatResponse(BaseModel):
     columns: list[str] = Field(default_factory=list)
     visualization: VisualizationSpec | None = None
     sources: list[dict[str, Any]] = Field(default_factory=list)
+    debug: dict[str, Any] = Field(default_factory=dict)
+    sub_results: list["TaskResult"] = Field(default_factory=list)
+
+
+class TaskResult(BaseModel):
+    intent: IntentName
+    title: str
+    answer: str
+    sql: str | None = None
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    columns: list[str] = Field(default_factory=list)
+    visualization: VisualizationSpec | None = None
     debug: dict[str, Any] = Field(default_factory=dict)
 
 

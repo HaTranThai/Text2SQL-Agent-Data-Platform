@@ -29,7 +29,7 @@ import {
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 const TRACE_STEP_DELAY_MS = 1700;
 
-type IntentName = "text_to_sql" | "visualization" | "news" | "ingestion" | "simple_finance";
+type IntentName = "general" | "text_to_sql" | "visualization" | "news" | "ingestion" | "simple_finance";
 
 type VisualizationSpec = {
   type: "line" | "bar" | "area" | "scatter";
@@ -48,7 +48,21 @@ type ChatResponse = {
   visualization?: VisualizationSpec | null;
   sources: Record<string, unknown>[];
   debug: Record<string, unknown>;
+  sub_results?: TaskResult[];
 };
+
+type TaskResult = {
+  intent: IntentName;
+  title: string;
+  answer: string;
+  sql?: string | null;
+  rows: Record<string, unknown>[];
+  columns: string[];
+  visualization?: VisualizationSpec | null;
+  debug: Record<string, unknown>;
+};
+
+type ResultPayload = ChatResponse | TaskResult;
 
 type RoutePreviewResponse = {
   intent: IntentName;
@@ -364,7 +378,8 @@ function ChatBubble({
 }) {
   const response = message.response;
   const visualization = response ? getVisualization(response) : null;
-  const shouldShowTable = Boolean(response && response.intent !== "news" && response.rows.length);
+  const hasSubResults = Boolean(response?.sub_results?.length);
+  const shouldShowTable = Boolean(response && !hasSubResults && response.intent !== "news" && response.rows.length);
   const missingTickers = response
     ? getRequestedTickers(response).filter((ticker) => !loadedTickers.has(ticker))
     : [];
@@ -387,7 +402,9 @@ function ChatBubble({
 
         {response ? <ProgressTrace response={response} mode="complete" /> : null}
 
-        {response && visualization && response.rows.length ? (
+        {response?.sub_results?.length ? <SubResults results={response.sub_results} /> : null}
+
+        {response && !hasSubResults && visualization && response.rows.length ? (
           <ArtifactCard title={chartTitle(visualization)} icon={<BarChart3 size={16} />}>
             <ResultChart response={response} visualization={visualization} />
           </ArtifactCard>
@@ -399,7 +416,7 @@ function ChatBubble({
           </ArtifactCard>
         ) : null}
 
-        {response?.sql ? (
+        {response?.sql && !hasSubResults ? (
           <details className="sql-details">
             <summary>
               <TerminalSquare size={14} aria-hidden="true" />
@@ -410,6 +427,42 @@ function ChatBubble({
         ) : null}
       </div>
     </article>
+  );
+}
+
+function SubResults({ results }: { results: TaskResult[] }) {
+  return (
+    <div className="sub-results">
+      {results.map((result, index) => {
+        const visualization = getVisualization(result);
+        const showTable = result.intent !== "news" && result.rows.length > 0;
+        return (
+          <section className="sub-result" key={`${result.title}-${index}`}>
+            <div className="sub-result-title">{result.title}</div>
+            <MessageContent content={result.answer} />
+            {visualization && result.rows.length ? (
+              <ArtifactCard title={chartTitle(visualization)} icon={<BarChart3 size={16} />}>
+                <ResultChart response={result} visualization={visualization} />
+              </ArtifactCard>
+            ) : null}
+            {showTable ? (
+              <ArtifactCard title={`${result.rows.length} rows`} icon={<Table2 size={16} />}>
+                <ResultTable response={result} />
+              </ArtifactCard>
+            ) : null}
+            {result.sql ? (
+              <details className="sql-details">
+                <summary>
+                  <TerminalSquare size={14} aria-hidden="true" />
+                  SQL
+                </summary>
+                <pre className="sql-block">{result.sql}</pre>
+              </details>
+            ) : null}
+          </section>
+        );
+      })}
+    </div>
   );
 }
 
@@ -470,6 +523,9 @@ function MessageContent({ content }: { content: string }) {
             </pre>
           );
         }
+        if (block.type === "table") {
+          return <MarkdownTable key={index} headers={block.headers} rows={block.rows} />;
+        }
         return <p key={index}>{renderInlineMarkdown(block.text)}</p>;
       })}
     </div>
@@ -480,7 +536,8 @@ type MessageBlock =
   | { type: "paragraph"; text: string }
   | { type: "heading"; level: 3 | 4; text: string }
   | { type: "list"; ordered: boolean; items: string[] }
-  | { type: "code"; text: string };
+  | { type: "code"; text: string }
+  | { type: "table"; headers: string[]; rows: string[][] };
 
 function parseMessageBlocks(content: string): MessageBlock[] {
   const lines = content.replace(/\r\n/g, "\n").split("\n");
@@ -502,7 +559,8 @@ function parseMessageBlocks(content: string): MessageBlock[] {
     }
   };
 
-  for (const rawLine of lines) {
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const rawLine = lines[lineIndex];
     const line = rawLine.trim();
     if (line.startsWith("```")) {
       if (code) {
@@ -523,6 +581,23 @@ function parseMessageBlocks(content: string): MessageBlock[] {
       flushParagraph();
       flushList();
       continue;
+    }
+
+    if (isMarkdownTableStart(lines, lineIndex)) {
+      flushParagraph();
+      flushList();
+      const tableLines: string[] = [line];
+      let cursor = lineIndex + 2;
+      while (cursor < lines.length && isMarkdownTableRow(lines[cursor].trim())) {
+        tableLines.push(lines[cursor].trim());
+        cursor += 1;
+      }
+      const parsed = parseMarkdownTable(tableLines);
+      if (parsed) {
+        blocks.push(parsed);
+        lineIndex = cursor - 1;
+        continue;
+      }
     }
 
     const heading = line.match(/^(#{1,4})\s+(.+)$/);
@@ -559,6 +634,61 @@ function parseMessageBlocks(content: string): MessageBlock[] {
   flushList();
   if (code) blocks.push({ type: "code", text: code.join("\n") });
   return blocks;
+}
+
+function MarkdownTable({ headers, rows }: { headers: string[]; rows: string[][] }) {
+  return (
+    <div className="markdown-table-wrap">
+      <table>
+        <thead>
+          <tr>
+            {headers.map((header, index) => (
+              <th key={`${header}-${index}`}>{renderInlineMarkdown(header)}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, rowIndex) => (
+            <tr key={rowIndex}>
+              {headers.map((_, columnIndex) => (
+                <td key={columnIndex}>{renderInlineMarkdown(row[columnIndex] ?? "")}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function isMarkdownTableStart(lines: string[], index: number): boolean {
+  return isMarkdownTableRow(lines[index]?.trim() ?? "") && isMarkdownTableDivider(lines[index + 1]?.trim() ?? "");
+}
+
+function isMarkdownTableRow(line: string): boolean {
+  return line.startsWith("|") && line.endsWith("|") && line.split("|").length >= 3;
+}
+
+function isMarkdownTableDivider(line: string): boolean {
+  return isMarkdownTableRow(line) && line
+    .slice(1, -1)
+    .split("|")
+    .every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
+}
+
+function parseMarkdownTable(lines: string[]): MessageBlock | null {
+  if (!lines.length) return null;
+  const headers = splitMarkdownTableRow(lines[0]);
+  const rows = lines.slice(1).map(splitMarkdownTableRow).filter((row) => row.length);
+  if (!headers.length || !rows.length) return null;
+  return { type: "table", headers, rows };
+}
+
+function splitMarkdownTableRow(line: string): string[] {
+  return line
+    .replace(/^\||\|$/g, "")
+    .split("|")
+    .map((cell) => cell.trim());
 }
 
 function renderInlineMarkdown(text: string): ReactNode[] {
@@ -672,7 +802,7 @@ function ResultChart({
   response,
   visualization,
 }: {
-  response: ChatResponse;
+  response: ResultPayload;
   visualization: VisualizationSpec;
 }) {
   const xKey = visualization.x ?? response.columns[0];
@@ -691,10 +821,11 @@ function ResultChart({
 
   const Chart = visualization.type === "bar" ? BarChart : AreaChart;
   const isMoneyChart = seriesKeys.some(isMoneyMetric);
+  const yDomain = visualization.type === "bar" ? undefined : priceAwareDomain(data, seriesKeys, isMoneyChart);
   return (
     <div className="chart-box">
-      <ResponsiveContainer width="100%" height={300}>
-        <Chart data={data} margin={{ top: 8, right: 24, bottom: 8, left: 10 }}>
+      <ResponsiveContainer width="100%" height={330}>
+        <Chart data={data} margin={{ top: 8, right: 28, bottom: 8, left: 4 }}>
           {visualization.type !== "bar" ? (
             <defs>
               {seriesKeys.map((key, index) => (
@@ -718,7 +849,8 @@ function ResultChart({
             axisLine={{ stroke: "#334155" }}
             tickLine={false}
             tickFormatter={(value) => formatAxisValue(value, { currency: isMoneyChart })}
-            width={76}
+            width={64}
+            domain={yDomain}
           />
           <Tooltip
             formatter={(value, name) => [
@@ -763,7 +895,7 @@ function ResultChart({
   );
 }
 
-function ResultTable({ response }: { response: ChatResponse }) {
+function ResultTable({ response }: { response: ResultPayload }) {
   const columns = response.columns.length ? response.columns : Object.keys(response.rows[0]);
   const rows = orderRowsForTable(response.rows, columns);
   return (
@@ -780,7 +912,7 @@ function ResultTable({ response }: { response: ChatResponse }) {
           {rows.map((row, rowIndex) => (
             <tr key={rowIndex}>
               {columns.map((column) => (
-                <td key={column}>{formatCell(row[column])}</td>
+                <td key={column}>{formatCell(row[column], column)}</td>
               ))}
             </tr>
           ))}
@@ -874,7 +1006,7 @@ function isMoneyMetric(key: string): boolean {
 }
 
 function buildChartData(
-  response: ChatResponse,
+  response: ResultPayload,
   xKey: string,
   yKey: string,
   seriesKey: string | null,
@@ -921,8 +1053,22 @@ function buildChartData(
   };
 }
 
+function priceAwareDomain(data: Record<string, unknown>[], seriesKeys: string[], isMoneyChart: boolean) {
+  if (!isMoneyChart) return undefined;
+  const values = data.flatMap((row) =>
+    seriesKeys
+      .map((key) => toFiniteNumber(row[key]))
+      .filter((value): value is number => value !== null),
+  );
+  if (!values.length) return undefined;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const spread = Math.max(max - min, Math.abs(max) * 0.02, 1);
+  return [Math.max(0, min - spread * 0.15), max + spread * 0.15];
+}
+
 function wideMetricColumns(
-  response: ChatResponse,
+  response: ResultPayload,
   xKey: string,
   yKey: string,
   chartType: VisualizationSpec["type"],
@@ -943,7 +1089,7 @@ function wideMetricColumns(
   return candidates.length > 1 ? candidates : [yKey];
 }
 
-function getVisualization(response: ChatResponse): VisualizationSpec | null {
+function getVisualization(response: ResultPayload): VisualizationSpec | null {
   if (!response.rows.length) return null;
   if (
     response.visualization?.x &&
@@ -1033,6 +1179,9 @@ function step(key: string, label: string, detail: string): ProgressStep {
 function pipelineStep(name: string): ProgressStep {
   const catalog: Record<string, ProgressStep> = {
     route_intent: step("route_intent", "Intent Router", "Chọn nhánh xử lý cho request"),
+    task_planner: step("task_planner", "Task planner", "Tách câu hỏi thành một hoặc nhiều tác vụ"),
+    execute_tasks: step("execute_tasks", "Task executor", "Chạy từng tác vụ theo kế hoạch"),
+    synthesize_response: step("synthesize_response", "Synthesize response", "Ghép kết quả các tác vụ thành câu trả lời"),
     parse_ingestion_request: step("parse_ingestion_request", "Parse ingestion request", "Lấy ticker, period và interval"),
     fetch_yfinance: step("fetch_yfinance", "YFinance ingestion", "Tải giá, fundamentals và news nếu bật"),
     upsert_postgres: step("upsert_postgres", "Upsert Postgres", "Ghi dữ liệu vào database"),
@@ -1056,10 +1205,21 @@ function pipelineStep(name: string): ProgressStep {
   return catalog[name] ?? step(name, labelize(name), "Completed");
 }
 
-function formatCell(value: unknown): string {
+function formatCell(value: unknown, column = ""): string {
   if (value === null || value === undefined) return "";
   if (typeof value === "number") {
-    return Math.abs(value) > 999 ? value.toLocaleString(undefined, { maximumFractionDigits: 2 }) : String(value);
+    const normalizedColumn = column.toLowerCase();
+    if (Number.isInteger(value) || normalizedColumn.includes("volume") || normalizedColumn.endsWith("_count")) {
+      return value.toLocaleString(undefined, { maximumFractionDigits: 0 });
+    }
+    if (
+      ["open", "high", "low", "close", "adj_close", "start_close", "end_close", "price", "last_price"].some(
+        (metric) => normalizedColumn === metric || normalizedColumn.endsWith(`_${metric}`),
+      )
+    ) {
+      return value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    return value.toLocaleString(undefined, { maximumFractionDigits: Math.abs(value) < 10 ? 4 : 2 });
   }
   if (Array.isArray(value)) return value.join(", ");
   if (typeof value === "object") return JSON.stringify(value);

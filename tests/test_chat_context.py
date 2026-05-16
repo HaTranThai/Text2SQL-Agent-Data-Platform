@@ -1,7 +1,9 @@
 from fintextsql.api.main import (
     SESSION_HISTORY,
+    SESSION_STATE,
     SESSION_TICKERS,
     _conversation_context_text,
+    _is_follow_up_ticker_reference,
     _message_with_context_tickers,
     _remember_session_turn,
     _resolve_context_tickers,
@@ -54,9 +56,15 @@ def test_ticker_extraction_ignores_vietnamese_helper_word_cho() -> None:
     assert extract_tickers("so sanh voi ma NVDA nua cho toi") == ["NVDA"]
 
 
+def test_ticker_extraction_accepts_common_company_aliases_and_typos() -> None:
+    assert extract_tickers("tin tức ảnh hưởng đến giá của apply") == ["AAPL"]
+    assert extract_tickers("so sánh apple với microsoft và nvidia") == ["AAPL", "MSFT", "NVDA"]
+
+
 def test_conversation_context_is_included_for_follow_up_messages() -> None:
     session_id = "test-context-window"
     SESSION_HISTORY.pop(session_id, None)
+    SESSION_STATE.pop(session_id, None)
     SESSION_TICKERS.pop(session_id, None)
 
     response = ChatResponse(
@@ -90,3 +98,71 @@ def test_conversation_context_is_included_for_follow_up_messages() -> None:
 
 def test_ticker_extraction_only_reads_uppercase_symbols_from_context() -> None:
     assert extract_tickers("recent conversation user asked from context AAPL MSFT") == ["AAPL", "MSFT"]
+
+
+def test_verification_follow_up_reuses_previous_single_ticker() -> None:
+    session_id = "test-aapl-verification-followup"
+    SESSION_HISTORY.pop(session_id, None)
+    SESSION_TICKERS.pop(session_id, None)
+
+    _remember_session_turn(
+        session_id,
+        "hiển thị giá đóng cửa cao nhất trong 8 tháng qua của AAPL",
+        ChatResponse(
+            intent="text_to_sql",
+            answer="Giá đóng cửa cao nhất của AAPL là 250.",
+            sql="SELECT date, close FROM prices WHERE ticker = 'AAPL' ORDER BY close DESC LIMIT 1",
+            rows=[{"date": "2026-05-01", "close": 250}],
+            columns=["date", "close"],
+        ),
+        RouteDecision("text_to_sql", "medium", ["AAPL"], "test"),
+    )
+
+    follow_up = "có chắc cái đó là cao nhất không, hãy liệt kê giá đóng cửa cao nhất trong từng tháng của 8 tháng qua"
+    tickers = _resolve_context_tickers(session_id, follow_up, [])
+    message = _message_with_context_tickers(
+        follow_up,
+        tickers,
+        [],
+        conversation_context=_conversation_context_text(session_id),
+    )
+
+    assert _is_follow_up_ticker_reference(follow_up)
+    assert tickers == ["AAPL"]
+    assert "Context tickers: AAPL" in message
+    assert "8 tháng" in message
+
+
+def test_structured_state_is_added_to_follow_up_context() -> None:
+    session_id = "test-structured-state"
+    SESSION_HISTORY.pop(session_id, None)
+    SESSION_STATE.pop(session_id, None)
+    SESSION_TICKERS.pop(session_id, None)
+
+    _remember_session_turn(
+        session_id,
+        "hiển thị giá đóng cửa cao nhất trong 8 tháng qua của AAPL",
+        ChatResponse(
+            intent="text_to_sql",
+            answer="Giá đóng cửa cao nhất của AAPL là 298.87.",
+            sql="SELECT ticker, date, close FROM highest_closes",
+            rows=[{"ticker": "AAPL", "date": "2026-05-13", "close": 298.87}],
+            columns=["ticker", "date", "close"],
+        ),
+        RouteDecision("text_to_sql", "medium", ["AAPL"], "test"),
+    )
+
+    context = _conversation_context_text(session_id)
+    follow_up = "có chắc cái đó không, liệt kê từng tháng"
+    message = _message_with_context_tickers(
+        follow_up,
+        ["AAPL"],
+        [],
+        conversation_context=context,
+    )
+
+    assert "current structured state" in context
+    assert "metric=highest_close" in context
+    assert "time_window=8 months" in context
+    assert "Structured follow-up contract" in message
+    assert "Use only these tickers: AAPL" in message

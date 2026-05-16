@@ -4,6 +4,7 @@ import re
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
+from unicodedata import category, normalize
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,9 +19,13 @@ from fintextsql.api.schemas import (
     IngestionRequest,
     IngestionResponse,
     RoutePreviewResponse,
+    TaskResult,
+    VisualizationSpec,
 )
 from fintextsql.core.config import Settings, get_settings
 from fintextsql.core.intent import IntentRouter, RouteDecision
+from fintextsql.core.policy import PolicyDecision, PolicyGuard
+from fintextsql.core.planner import AgentPlan, PlannedTask, TaskPlanner
 from fintextsql.db.models import Company
 from fintextsql.db.session import get_db, init_db
 from fintextsql.ingestion.yfinance_service import YFinanceIngestionService
@@ -35,6 +40,7 @@ settings = get_settings()
 SESSION_TICKERS: dict[str, list[str]] = {}
 SESSION_MESSAGES: dict[str, str] = {}
 SESSION_HISTORY: dict[str, list[dict[str, Any]]] = {}
+SESSION_STATE: dict[str, dict[str, Any]] = {}
 MAX_SESSION_TURNS = 8
 app = FastAPI(title="FinTextSQL", version="0.1.0")
 app.add_middleware(
@@ -101,7 +107,12 @@ async def chat(
     db: Session = Depends(get_db),
     current_settings: Settings = Depends(get_settings),
 ) -> ChatResponse:
+    policy = PolicyGuard().check(payload.message)
+    if policy.triggered:
+        return _policy_chat_response(policy)
+
     router = IntentRouter()
+    agent_plan = TaskPlanner(SESSION_STATE.get(payload.session_id)).plan(payload.message)
     decision = router.route(payload.message)
     explicit_tickers = list(decision.tickers)
     should_use_conversation_context = _should_use_conversation_context(payload.message, explicit_tickers)
@@ -117,10 +128,41 @@ async def chat(
         explicit_tickers,
         conversation_context=conversation_context,
     )
+    if len(agent_plan.tasks) == 1 and decision.intent in {"text_to_sql", "visualization"}:
+        effective_message = agent_plan.tasks[0].message
+        if conversation_context:
+            effective_message = "\n\n".join([effective_message, conversation_context])
     llm = LLMClient(current_settings)
     text_to_sql = TextToSQLService(db, current_settings, llm)
 
     try:
+        if len(agent_plan.tasks) > 1:
+            response = await _execute_agent_plan(
+                payload=payload,
+                plan=agent_plan,
+                db=db,
+                settings=current_settings,
+                llm=llm,
+            )
+            _remember_session_turn(payload.session_id, payload.message, response, decision)
+            return response
+
+        if decision.intent == "general":
+            response = ChatResponse(
+                intent="general",
+                answer=_general_chat_answer(payload.message),
+                debug={
+                    "router": asdict(decision),
+                    "pipeline": ["general_help"],
+                    "planner": agent_plan.to_debug(),
+                    "task_count": len(agent_plan.tasks),
+                    "context_used": agent_plan.context_used,
+                    "resolved_state": agent_plan.resolved_state,
+                },
+            )
+            _remember_session_turn(payload.session_id, payload.message, response, decision)
+            return response
+
         if decision.intent == "ingestion":
             tickers = decision.tickers or ["AAPL", "MSFT", "NVDA"]
             run = await YFinanceIngestionService(db).ingest(
@@ -145,6 +187,10 @@ async def chat(
                 debug={
                     "router": asdict(decision),
                     "pipeline": ["parse_ingestion_request", "fetch_yfinance", "upsert_postgres"],
+                    "planner": agent_plan.to_debug(),
+                    "task_count": len(agent_plan.tasks),
+                    "context_used": agent_plan.context_used,
+                    "resolved_state": agent_plan.resolved_state,
                 },
             )
             _remember_session_turn(payload.session_id, payload.message, response, decision)
@@ -158,7 +204,14 @@ async def chat(
                 rows=sources,
                 columns=list(sources[0].keys()) if sources else [],
                 sources=sources,
-                debug={"router": asdict(decision), "pipeline": ["load_news", "analyze_news", "format_sources"]},
+                debug={
+                    "router": asdict(decision),
+                    "pipeline": ["load_news", "analyze_news", "format_sources"],
+                    "planner": agent_plan.to_debug(),
+                    "task_count": len(agent_plan.tasks),
+                    "context_used": agent_plan.context_used,
+                    "resolved_state": agent_plan.resolved_state,
+                },
             )
             _remember_session_turn(payload.session_id, payload.message, response, decision)
             return response
@@ -176,6 +229,10 @@ async def chat(
                 debug={
                     "router": asdict(decision),
                     "pipeline": ["quote_lookup", "fallback_postgres_if_needed", "infer_visualization"],
+                    "planner": agent_plan.to_debug(),
+                    "task_count": len(agent_plan.tasks),
+                    "context_used": agent_plan.context_used,
+                    "resolved_state": agent_plan.resolved_state,
                 },
             )
             _remember_session_turn(payload.session_id, payload.message, response, decision)
@@ -193,6 +250,10 @@ async def chat(
                 debug={
                     **result.debug,
                     "router": asdict(decision),
+                    "planner": agent_plan.to_debug(),
+                    "task_count": len(agent_plan.tasks),
+                    "context_used": agent_plan.context_used,
+                    "resolved_state": agent_plan.resolved_state,
                     "pipeline": [*result.debug.get("pipeline", []), "infer_visualization"],
                 },
             )
@@ -207,7 +268,14 @@ async def chat(
             rows=result.rows,
             columns=result.columns,
             visualization=infer_visualization(payload.message, result.columns, result.rows),
-            debug={**result.debug, "router": asdict(decision)},
+            debug={
+                **result.debug,
+                "router": asdict(decision),
+                "planner": agent_plan.to_debug(),
+                "task_count": len(agent_plan.tasks),
+                "context_used": agent_plan.context_used,
+                "resolved_state": agent_plan.resolved_state,
+            },
         )
         _remember_session_turn(payload.session_id, payload.message, response, decision)
         return response
@@ -217,8 +285,19 @@ async def chat(
 
 @app.post("/chat/route", response_model=RoutePreviewResponse)
 async def chat_route(payload: ChatRequest) -> RoutePreviewResponse:
+    policy = PolicyGuard().check(payload.message)
+    if policy.triggered:
+        return RoutePreviewResponse(
+            intent="general",
+            tickers=[],
+            reason=policy.answer,
+            pipeline=["policy_guard"],
+            router={"intent": "general", "confidence": "high", "tickers": [], "policy_guard": policy.to_debug()},
+        )
+
     router = IntentRouter()
     decision = router.route(payload.message)
+    agent_plan = TaskPlanner(SESSION_STATE.get(payload.session_id)).plan(payload.message)
     explicit_tickers = list(decision.tickers)
     context_tickers = _resolve_context_tickers(payload.session_id, payload.message, decision.tickers)
     if context_tickers:
@@ -230,7 +309,84 @@ async def chat_route(payload: ChatRequest) -> RoutePreviewResponse:
         tickers=decision.tickers,
         reason=decision.reason,
         pipeline=_preview_pipeline(decision.intent),
-        router=asdict(decision),
+        router={**asdict(decision), "planner": agent_plan.to_debug(), "task_count": len(agent_plan.tasks)},
+    )
+
+
+async def _execute_agent_plan(
+    *,
+    payload: ChatRequest,
+    plan: AgentPlan,
+    db: Session,
+    settings: Settings,
+    llm: LLMClient,
+) -> ChatResponse:
+    sub_results: list[TaskResult] = []
+    for task in plan.tasks:
+        sub_results.append(await _execute_planned_task(task, db=db, settings=settings, llm=llm))
+
+    primary = sub_results[0]
+    answer_parts = [f"### {result.title}\n{result.answer}" for result in sub_results]
+    return ChatResponse(
+        intent=primary.intent,
+        answer="\n\n".join(answer_parts),
+        sql=primary.sql,
+        rows=primary.rows,
+        columns=primary.columns,
+        visualization=primary.visualization,
+        sub_results=sub_results,
+        debug={
+            "pipeline": ["task_planner", "execute_tasks", "synthesize_response"],
+            "planner": plan.to_debug(),
+            "task_count": len(plan.tasks),
+            "context_used": plan.context_used,
+            "resolved_state": plan.resolved_state,
+        },
+    )
+
+
+async def _execute_planned_task(
+    task: PlannedTask,
+    *,
+    db: Session,
+    settings: Settings,
+    llm: LLMClient,
+) -> TaskResult:
+    if task.intent == "news":
+        answer, sources = await NewsService(db, llm).answer(task.message, task.tickers)
+        return TaskResult(
+            intent="news",
+            title=task.title,
+            answer=answer,
+            rows=sources,
+            columns=list(sources[0].keys()) if sources else [],
+            debug={"pipeline": ["load_news", "analyze_news", "format_sources"], "task": asdict(task)},
+        )
+    text_to_sql = TextToSQLService(db, settings, llm)
+    if task.intent == "visualization":
+        result, viz = await VisualizationService(text_to_sql).answer(task.message)
+        if {"quarter", "pct_change"}.issubset(set(result.columns)):
+            viz = VisualizationSpec(type="bar", x="quarter", y="pct_change", series="ticker", title="Quarterly close % change")
+        return TaskResult(
+            intent="visualization",
+            title=task.title,
+            answer="Đã tạo biểu đồ từ cùng truy vấn để dễ so sánh các quý.",
+            sql=result.sql,
+            rows=result.rows,
+            columns=result.columns,
+            visualization=viz,
+            debug={**result.debug, "pipeline": [*result.debug.get("pipeline", []), "infer_visualization"], "task": asdict(task)},
+        )
+    result = await text_to_sql.answer(task.message)
+    return TaskResult(
+        intent="text_to_sql",
+        title=task.title,
+        answer=result.answer,
+        sql=result.sql,
+        rows=result.rows,
+        columns=result.columns,
+        visualization=infer_visualization(task.message, result.columns, result.rows),
+        debug={**result.debug, "task": asdict(task)},
     )
 
 
@@ -240,6 +396,10 @@ async def query_sql(
     db: Session = Depends(get_db),
     current_settings: Settings = Depends(get_settings),
 ) -> ChatResponse:
+    policy = PolicyGuard().check(payload.message)
+    if policy.triggered:
+        return _policy_chat_response(policy)
+
     result = await TextToSQLService(db, current_settings, LLMClient(current_settings)).answer(payload.message)
     return ChatResponse(
         intent="text_to_sql",
@@ -249,6 +409,25 @@ async def query_sql(
         columns=result.columns,
         visualization=infer_visualization(payload.message, result.columns, result.rows),
         debug=result.debug,
+    )
+
+
+def _policy_chat_response(policy: PolicyDecision) -> ChatResponse:
+    return ChatResponse(
+        intent="general",
+        answer=policy.answer,
+        rows=[],
+        columns=[],
+        debug={
+            "pipeline": ["policy_guard"],
+            "policy_guard": policy.to_debug(),
+            "router": {
+                "intent": "general",
+                "confidence": "high",
+                "tickers": [],
+                "reason": policy.category or "policy_guard",
+            },
+        },
     )
 
 
@@ -267,6 +446,8 @@ def _period_from_message(message: str) -> str:
 
 
 def _preview_pipeline(intent: str) -> list[str]:
+    if intent == "general":
+        return ["general_help"]
     if intent == "ingestion":
         return ["parse_ingestion_request", "fetch_yfinance", "upsert_postgres"]
     if intent == "news":
@@ -287,6 +468,36 @@ def _preview_pipeline(intent: str) -> list[str]:
     return ["load_schema", "schema_selector", "planner", "sql_generator", "sql_guard", "execute_sql", "explainer"]
 
 
+def _general_chat_answer(message: str) -> str:
+    text = _strip_vietnamese_accents(message.lower())
+    if any(word in text for word in ["xin chao", "hello", "hi"]):
+        opener = "Chào bạn. Mình là trợ lý phân tích dữ liệu tài chính của FinTextSQL."
+    else:
+        opener = "Mình có thể hỗ trợ bạn phân tích dữ liệu tài chính bằng câu hỏi tự nhiên."
+
+    return "\n".join(
+        [
+            opener,
+            "",
+            "### Mình làm tốt các việc này",
+            "- Tra cứu và so sánh giá đóng cửa, volume, market cap, P/E, beta.",
+            "- Sinh SQL an toàn từ câu hỏi và trả bảng kết quả.",
+            "- Vẽ chart giá theo thời gian cho một hoặc nhiều mã.",
+            "- Lấy và tóm tắt tin tức có thể ảnh hưởng tới một ticker.",
+            "- Nhớ ngữ cảnh ngắn hạn trong cùng cuộc trò chuyện, ví dụ “các mã đó”, “cùng khoảng thời gian”, “cái đó”.",
+            "",
+            "### Ví dụ bạn có thể hỏi",
+            "- `Giá đóng cửa cao nhất trong 8 tháng qua của AAPL là ngày nào?`",
+            "- `Liệt kê giá đóng cửa cao nhất từng tháng của AAPL trong 8 tháng qua`",
+            "- `So sánh AAPL, MSFT, NVDA trong 180 ngày gần nhất`",
+            "- `Có tin gì mới có thể ảnh hưởng tới giá Apple không?`",
+            "- `Vẽ chart giá đóng cửa của AAPL và MSFT trong 60 ngày gần nhất`",
+            "",
+            "Bạn cứ hỏi như đang nói chuyện bình thường; nếu viết `apple`, `appl` hoặc lỡ gõ `apply`, mình sẽ hiểu là `AAPL`.",
+        ]
+    )
+
+
 def _resolve_context_tickers(
     session_id: str | None,
     message: str,
@@ -300,7 +511,9 @@ def _resolve_context_tickers(
     if explicit_tickers:
         _remember_session_tickers(session_id, explicit_tickers)
         return explicit_tickers
-    if not session_id or not _is_follow_up_ticker_reference(message):
+    if not session_id or not (
+        _is_follow_up_ticker_reference(message) or _is_implicit_same_ticker_reference(message)
+    ):
         return []
     return SESSION_TICKERS.get(session_id, [])
 
@@ -326,17 +539,19 @@ def _remember_session_turn(
 
     _remember_session_message(session_id, user_message)
     _remember_session_tickers(session_id, decision.tickers)
+    state = _extract_turn_state(user_message, response, decision)
+    _remember_session_state(session_id, state)
 
     history = SESSION_HISTORY.setdefault(session_id, [])
     history.append(
         {
-            "user": user_message.strip(),
+            "user": _compact_text(user_message.strip(), 180),
             "intent": response.intent,
             "tickers": decision.tickers[:10],
-            "answer": _compact_text(response.answer, 320),
-            "sql": _compact_text(response.sql or "", 500),
             "columns": response.columns[:12],
             "row_count": len(response.rows),
+            "summary": _turn_context_summary(user_message, response, decision),
+            "state": state,
         }
     )
     del history[:-MAX_SESSION_TURNS]
@@ -349,7 +564,13 @@ def _conversation_context_text(session_id: str | None, limit: int = 6) -> str:
     if not history:
         return ""
 
-    lines = ["recent conversation context:"]
+    lines = [
+        "recent conversation context:",
+        "This is a compact summary only. Never copy a previous answer verbatim; always answer the latest question with fresh reasoning and fresh SQL when data is needed.",
+    ]
+    state = SESSION_STATE.get(session_id)
+    if state:
+        lines.append(f"current structured state: {_format_state(state)}")
     for index, turn in enumerate(history, start=1):
         lines.append(f"turn {index} user question: {turn.get('user', '')}")
         tickers = turn.get("tickers") or []
@@ -360,41 +581,90 @@ def _conversation_context_text(session_id: str | None, limit: int = 6) -> str:
         row_count = turn.get("row_count", 0)
         if columns:
             lines.append(f"turn {index} result shape: {row_count} rows; columns: {', '.join(columns)}")
-        answer = str(turn.get("answer") or "")
-        if answer:
-            lines.append(f"turn {index} answer summary: {answer}")
+        turn_state = turn.get("state") or {}
+        if turn_state:
+            lines.append(f"turn {index} structured state: {_format_state(turn_state)}")
+        summary = str(turn.get("summary") or "")
+        if summary:
+            lines.append(f"turn {index} result summary: {summary}")
     lines.append(
-        "Use this context to resolve follow-up references like 'ma tren', '2 ma tren', "
-        "'them another ticker', or 'the same tickers'."
+        "Use this context to resolve follow-up references like 'cai do', 'ma tren', '2 ma tren', "
+        "'them another ticker', 'the same tickers', or verification questions about the previous result."
     )
     lines.append("For follow-up SQL, use only the context tickers unless the latest user question explicitly replaces them.")
+    lines.append(
+        "When the latest question says 'same period', 'cung khoang thoi gian', 'cai do', or 'ket qua do', "
+        "reuse metric and time_window from current structured state unless explicitly changed."
+    )
     return "\n".join(lines)
 
 
 def _is_follow_up_ticker_reference(message: str) -> bool:
     text = message.lower()
+    ascii_text = _strip_vietnamese_accents(text)
+    variants = (text, ascii_text)
     return any(
-        phrase in text
+        phrase in variant
+        for variant in variants
         for phrase in [
+            "cái đó",
+            "cai do",
+            "cái này",
+            "cai nay",
+            "điều đó",
+            "dieu do",
+            "kết quả đó",
+            "ket qua do",
+            "kết quả trên",
+            "ket qua tren",
+            "có chắc",
+            "co chac",
+            "chắc không",
+            "chac khong",
             "mã trên",
             "ma tren",
             "2 mã",
+            "2 ma",
             "hai mã",
+            "hai ma",
             "các mã trên",
             "cac ma tren",
             "ở trên",
             "o tren",
+            "vừa rồi",
+            "vua roi",
+            "ban nãy",
+            "ban nay",
+            "trước đó",
+            "truoc do",
+            "câu trước",
+            "cau truoc",
+            "lượt trước",
+            "luot truoc",
+            "previous result",
             "above",
             "previous",
             "same tickers",
+            "same ticker",
+            "that result",
+            "that one",
+            "cùng khoảng thời gian",
+            "cung khoang thoi gian",
+            "cùng giai đoạn",
+            "cung giai doan",
+            "same period",
+            "same window",
         ]
     )
 
 
 def _is_additive_ticker_reference(message: str) -> bool:
     text = message.lower()
+    ascii_text = _strip_vietnamese_accents(text)
+    variants = (text, ascii_text)
     return any(
-        phrase in text
+        phrase in variant
+        for variant in variants
         for phrase in [
             "nữa",
             "nua",
@@ -407,7 +677,6 @@ def _is_additive_ticker_reference(message: str) -> bool:
             "also",
             "add",
             "include",
-            "with",
         ]
     )
 
@@ -417,7 +686,259 @@ def _should_use_conversation_context(message: str, explicit_tickers: list[str]) 
         return True
     if explicit_tickers and _is_additive_ticker_reference(message):
         return True
+    if not explicit_tickers and _is_implicit_same_ticker_reference(message):
+        return True
     return False
+
+
+def _is_implicit_same_ticker_reference(message: str) -> bool:
+    text = _strip_vietnamese_accents(message.lower())
+    has_metric = any(
+        phrase in text
+        for phrase in [
+            "volume",
+            "khoi luong",
+            "giao dich",
+            "gia",
+            "close",
+            "open",
+            "high",
+            "low",
+            "ohlc",
+            "return",
+            "loi suat",
+            "bien dong",
+            "market cap",
+            "von hoa",
+        ]
+    )
+    has_specific_request = any(
+        phrase in text
+        for phrase in [
+            "lay ",
+            "cho toi",
+            "hien thi",
+            "so sanh",
+            "vao ngay",
+            "phien",
+            "quy ",
+            "thang ",
+            "nam ",
+        ]
+    ) or bool(re.search(r"\b20\d{2}-\d{2}-\d{2}\b", text))
+    asks_universe = any(
+        phrase in text
+        for phrase in [
+            "ticker nao",
+            "ma nao",
+            "co phieu nao",
+            "cong ty nao",
+            "top ",
+            "xep hang",
+            "tat ca ma",
+            "cac ma",
+            "cac ticker",
+        ]
+    )
+    return has_metric and has_specific_request and not asks_universe
+
+
+def _remember_session_state(session_id: str | None, state: dict[str, Any]) -> None:
+    if not session_id:
+        return
+    previous = SESSION_STATE.get(session_id, {})
+    merged = {**previous, **{key: value for key, value in state.items() if value not in (None, [], "")}}
+    if merged:
+        SESSION_STATE[session_id] = merged
+
+
+def _extract_turn_state(
+    user_message: str,
+    response: ChatResponse,
+    decision: RouteDecision,
+) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "intent": response.intent,
+        "tickers": decision.tickers[:10],
+        "active_tickers": decision.tickers[:10],
+    }
+    metric = _infer_metric(user_message, response.columns)
+    if metric:
+        state["metric"] = metric
+        state["last_metric"] = metric
+    window = _infer_time_window(user_message)
+    if window:
+        state["time_window"] = window
+        state["last_time_window"] = window
+    grouping = _infer_grouping(user_message, response.columns)
+    if grouping:
+        state["grouping"] = grouping
+        state["last_grouping"] = grouping
+    if response.sql:
+        state["last_sql_kind"] = _infer_sql_kind(response.sql, response.columns)
+    if response.columns:
+        state["columns"] = response.columns[:12]
+    state["row_count"] = len(response.rows)
+    state["last_task_result"] = {
+        "intent": response.intent,
+        "row_count": len(response.rows),
+        "columns": response.columns[:12],
+        "summary": _turn_context_summary(user_message, response, decision),
+    }
+    return state
+
+
+def _infer_metric(message: str, columns: list[str]) -> str | None:
+    text = _strip_vietnamese_accents(message.lower())
+    column_text = " ".join(columns).lower()
+    combined = f"{text} {column_text}"
+    if "market cap" in combined or "von hoa" in combined:
+        return "market_cap"
+    if ("open" in combined or "gia mo cua" in combined) and ("high" in combined or "cao nhat" in combined) and (
+        "low" in combined or "thap nhat" in combined
+    ):
+        return "ohlc"
+    if "volume" in combined:
+        return "volume"
+    if "pe" in combined or "p/e" in combined:
+        return "pe_ratio"
+    if "close" in combined or "gia dong cua" in combined:
+        if "cao nhat" in combined or "highest" in combined or "max" in combined:
+            return "highest_close"
+        if "thap nhat" in combined or "lowest" in combined or "min" in combined:
+            return "lowest_close"
+        return "close_price"
+    if "tin tuc" in combined or "news" in combined:
+        return "news"
+    return None
+
+
+def _infer_time_window(message: str) -> str | None:
+    text = _strip_vietnamese_accents(message.lower())
+    patterns = [
+        (r"\b(\d{1,4})\s*(ngay|days?|d)\b", "days"),
+        (r"\b(\d{1,2})\s*(thang|months?|mo)\b", "months"),
+        (r"\b(\d{1,2})\s*(nam|years?|yrs?|y)\b", "years"),
+    ]
+    for pattern, unit in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return f"{int(match.group(1))} {unit}"
+    return None
+
+
+def _infer_grouping(message: str, columns: list[str]) -> str | None:
+    text = _strip_vietnamese_accents(message.lower())
+    column_text = " ".join(columns).lower()
+    if "quarter" in column_text or "quy" in text:
+        return "quarter"
+    if "month" in column_text or "thang" in text:
+        return "month"
+    return None
+
+
+def _infer_sql_kind(sql: str, columns: list[str]) -> str:
+    sql_l = sql.lower()
+    if "date_trunc('month'" in sql_l:
+        return "monthly_aggregate"
+    if "row_number()" in sql_l and "order by p.close desc" in sql_l:
+        return "ranked_high_close"
+    if {"date", "close"}.issubset(set(columns)):
+        return "daily_price_series"
+    return "select"
+
+
+def _format_state(state: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in [
+        "intent",
+        "active_tickers",
+        "tickers",
+        "metric",
+        "last_metric",
+        "time_window",
+        "last_time_window",
+        "grouping",
+        "last_grouping",
+        "last_sql_kind",
+        "columns",
+        "row_count",
+    ]:
+        value = state.get(key)
+        if value not in (None, [], ""):
+            if isinstance(value, list):
+                value = ", ".join(str(item) for item in value)
+            parts.append(f"{key}={value}")
+    return "; ".join(parts)
+
+
+def _turn_context_summary(user_message: str, response: ChatResponse, decision: RouteDecision) -> str:
+    parts: list[str] = []
+    tickers = decision.tickers[:10]
+    metric = _infer_metric(user_message, response.columns)
+    window = _infer_time_window(user_message)
+    grouping = _infer_grouping(user_message, response.columns)
+    if tickers:
+        parts.append(f"tickers={', '.join(tickers)}")
+    if metric:
+        parts.append(f"metric={metric}")
+    if window:
+        parts.append(f"window={window}")
+    if grouping:
+        parts.append(f"grouping={grouping}")
+    parts.append(f"intent={response.intent}")
+    parts.append(f"rows={len(response.rows)}")
+    if response.columns:
+        parts.append(f"columns={', '.join(response.columns[:8])}")
+
+    profile = _result_profile(response.rows, response.columns)
+    if profile:
+        parts.append(profile)
+    return _compact_text("; ".join(parts), 420)
+
+
+def _result_profile(rows: list[dict[str, Any]], columns: list[str]) -> str:
+    if not rows:
+        return "result=empty"
+    profiles: list[str] = []
+    date_columns = [column for column in columns if column.endswith("date") or column == "date"]
+    for column in date_columns[:2]:
+        dates = sorted(str(row.get(column))[:10] for row in rows if row.get(column))
+        if dates:
+            profiles.append(f"{column}_range={dates[0]}..{dates[-1]}")
+
+    for column in ["ticker", "target_volume", "quarter_max_volume", "volume", "close", "market_cap", "pct_change"]:
+        if column not in columns:
+            continue
+        values = [row.get(column) for row in rows if row.get(column) not in (None, "")]
+        if not values:
+            continue
+        if column == "ticker":
+            unique = []
+            for value in values:
+                text = str(value)
+                if text not in unique:
+                    unique.append(text)
+            profiles.append(f"tickers_in_result={', '.join(unique[:6])}")
+        elif _is_scalar_number(values[0]):
+            numeric_values = [float(value) for value in values if _is_scalar_number(value)]
+            if numeric_values:
+                profiles.append(
+                    f"{column}_min={_format_profile_number(min(numeric_values))}, {column}_max={_format_profile_number(max(numeric_values))}"
+                )
+        else:
+            profiles.append(f"{column}_sample={values[0]}")
+    return "; ".join(profiles[:5])
+
+
+def _is_scalar_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _format_profile_number(value: float) -> str:
+    if abs(value) >= 1_000_000:
+        return f"{value:,.0f}"
+    return f"{value:,.4f}".rstrip("0").rstrip(".")
 
 
 def _merge_tickers(previous: list[str], current: list[str]) -> list[str]:
@@ -448,9 +969,35 @@ def _message_with_context_tickers(
             "from recent conversation, and apply the context tickers above unless the latest user question "
             "explicitly asks for a different metric or window."
         )
+    state_instruction = _state_follow_up_instruction(message, tickers)
+    if state_instruction:
+        context_lines.append(state_instruction)
     if not context_lines:
         return message
     return "\n\n".join([message, *context_lines])
+
+
+def _state_follow_up_instruction(message: str, tickers: list[str]) -> str:
+    text = _strip_vietnamese_accents(message.lower())
+    if not any(
+        phrase in text
+        for phrase in [
+            "cai do",
+            "ket qua do",
+            "cung khoang thoi gian",
+            "cung giai doan",
+            "same period",
+            "same window",
+            "that result",
+        ]
+    ):
+        return ""
+    ticker_text = f" Use only these tickers: {', '.join(tickers)}." if tickers else ""
+    return (
+        "Structured follow-up contract: resolve pronouns and omitted details from current structured state. "
+        "Do not broaden to all tickers or a different time window unless explicitly requested."
+        f"{ticker_text}"
+    )
 
 
 def _compact_text(value: str, max_length: int) -> str:
@@ -458,3 +1005,8 @@ def _compact_text(value: str, max_length: int) -> str:
     if len(compacted) <= max_length:
         return compacted
     return compacted[: max_length - 3].rstrip() + "..."
+
+
+def _strip_vietnamese_accents(value: str) -> str:
+    value = value.replace("đ", "d").replace("Đ", "D")
+    return "".join(char for char in normalize("NFD", value) if category(char) != "Mn")

@@ -14,6 +14,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    networks:
+      - fintextsql-network
 
   backend:
     build:
@@ -25,7 +27,7 @@ services:
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-local-model}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:15173,http://127.0.0.1:15173,http://localhost:5173,http://127.0.0.1:5173,https://data-platform.mrworld.io.vn}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:15173,http://127.0.0.1:15173,http://localhost:5173,http://127.0.0.1:5173,https://data-platform.mrworld.id.vn}
     ports:
       - "${BACKEND_PORT:-18000}:8000"
     volumes:
@@ -35,20 +37,22 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - fintextsql-network
 
   frontend:
     build:
       context: ./frontend
+      args:
+        VITE_API_URL: ${VITE_API_URL:-/api}
     environment:
       VITE_API_URL: ${VITE_API_URL:-/api}
     ports:
       - "${FRONTEND_PORT:-15173}:5173"
-    volumes:
-      - ./frontend/src:/app/src:ro
-      - ./frontend/index.html:/app/index.html:ro
-      - ./frontend/vite.config.ts:/app/vite.config.ts:ro
     depends_on:
       - backend
+    networks:
+      - fintextsql-network
 
   cloudflared:
     image: cloudflare/cloudflared:latest
@@ -56,6 +60,13 @@ services:
     restart: unless-stopped
     depends_on:
       - frontend
+    networks:
+      - fintextsql-network
 
 volumes:
   postgres-data:
+
+networks:
+  fintextsql-network:
+    name: fintextsql-network
+    driver: bridge

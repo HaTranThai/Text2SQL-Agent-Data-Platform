@@ -22,3 +22,8 @@ def test_rejects_unknown_table() -> None:
 def test_adds_limit() -> None:
     assert ensure_limit("select ticker from companies", 50).endswith("LIMIT 50")
 
+
+def test_accepts_cte_names_when_underlying_tables_are_allowed() -> None:
+    sql = validate_select_sql("with q as (select * from prices) select * from q")
+
+    assert sql.startswith("with q")

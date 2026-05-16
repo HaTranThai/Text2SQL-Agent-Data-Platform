@@ -271,6 +271,10 @@ p {
   max-width: min(1120px, calc(100% - 44px));
 }
 
+.chat-message.assistant .bubble-body {
+  width: min(1120px, calc(100% - 44px));
+}
+
 .chat-message.user .bubble-body {
   background: #24577f;
   border-radius: 18px 18px 4px 18px;
@@ -374,6 +378,22 @@ p {
   word-break: break-word;
 }
 
+.markdown-table-wrap {
+  border: 1px solid #dce2e8;
+  border-radius: 8px;
+  max-width: min(760px, 100%);
+  overflow: auto;
+}
+
+.markdown-table-wrap table {
+  min-width: 420px;
+}
+
+.markdown-table-wrap th,
+.markdown-table-wrap td {
+  white-space: nowrap;
+}
+
 .artifact-card {
   background: #ffffff;
   border: 1px solid #dce2e8;
@@ -382,6 +402,24 @@ p {
   margin-top: 12px;
   overflow: hidden;
   width: min(1120px, 100%);
+}
+
+.sub-results {
+  display: grid;
+  gap: 14px;
+  margin-top: 12px;
+}
+
+.sub-result {
+  border-top: 1px solid #e2e8ef;
+  padding-top: 12px;
+}
+
+.sub-result-title {
+  color: #344054;
+  font-size: 13px;
+  font-weight: 850;
+  margin-bottom: 8px;
 }
 
 .artifact-header {
@@ -400,8 +438,8 @@ p {
 }
 
 .chart-box {
-  height: 324px;
-  padding: 16px 12px 8px;
+  height: 360px;
+  padding: 18px 14px 10px;
 }
 
 .chart-box .recharts-cartesian-axis-tick-value {
@@ -414,7 +452,7 @@ p {
 }
 
 .table-wrap {
-  max-height: 280px;
+  max-height: 340px;
   overflow: auto;
 }
 
@@ -427,9 +465,9 @@ table {
 th,
 td {
   border-bottom: 1px solid #e6ebf1;
-  max-width: 240px;
+  max-width: 280px;
   overflow: hidden;
-  padding: 9px 11px;
+  padding: 10px 12px;
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;

@@ -42,8 +42,11 @@ def validate_select_sql(sql: str) -> str:
     if not isinstance(expression, (exp.Select, exp.Union)):
         raise SQLValidationError("SQL must be a SELECT query")
 
+    cte_names = {cte.alias.lower() for cte in expression.find_all(exp.CTE) if cte.alias}
     for table in expression.find_all(exp.Table):
         table_name = table.name.lower()
+        if table_name in cte_names:
+            continue
         if table_name not in ALLOWED_TABLES:
             raise SQLValidationError(f"Table '{table_name}' is not available")
 
