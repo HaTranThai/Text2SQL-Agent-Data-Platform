@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import operator
 import re
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Annotated, Any, TypedDict
 
+from langgraph.graph import END, START, StateGraph
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -14,8 +16,16 @@ from sqlalchemy.orm import Session
 from fintextsql.core.config import Settings
 from fintextsql.core.tickers import extract_tickers
 from fintextsql.llm.client import LLMClient, LLMError, LLMMessage
-from fintextsql.text2sql.schema import SelectedSchema, select_schema
-from fintextsql.text2sql.sql_guard import SQLValidationError, ensure_limit, validate_select_sql
+from fintextsql.text2sql.knowledge import Knowledge, extract_knowledge
+from fintextsql.text2sql.schema import SelectedSchema, generation_schema_text, select_schema
+from fintextsql.text2sql.sql_guard import (
+    SQLValidationError,
+    clean_sql,
+    ensure_limit,
+    validate_select_sql,
+)
+
+CANDIDATE_COUNT = 3
 
 
 @dataclass(slots=True)
@@ -27,6 +37,24 @@ class TextToSQLResult:
     debug: dict[str, Any] = field(default_factory=dict)
 
 
+class T2SState(TypedDict, total=False):
+    """State flowing through the text-to-SQL LangGraph pipeline."""
+
+    question: str
+    knowledge: str
+    selected_tables: list[str]
+    plan: str
+    sql: str
+    candidates: list[str]
+    rows: list[dict[str, Any]]
+    columns: list[str]
+    attempt: int
+    error: str | None
+    last_error: str | None
+    answer: str
+    pipeline: Annotated[list[str], operator.add]
+
+
 class TextToSQLService:
     def __init__(self, db: Session, settings: Settings, llm: LLMClient):
         self.db = db
@@ -34,58 +62,168 @@ class TextToSQLService:
         self.llm = llm
 
     async def answer(self, question: str) -> TextToSQLResult:
-        selected_schema = select_schema(question)
-        debug: dict[str, Any] = {
-            "selected_tables": selected_schema.tables,
-            "pipeline": ["load_schema", "schema_selector"],
-        }
-        deterministic_sql = _deterministic_sql(question, self.settings.max_sql_rows)
-        if deterministic_sql:
-            plan = "Use deterministic SQL for the clearly recognized finance metric."
-            sql = deterministic_sql
-            debug["pipeline"].append("deterministic_sql")
-        else:
-            plan = await self._plan(question, selected_schema)
-            sql = await self._generate_sql(question, selected_schema, plan)
-            debug["pipeline"].extend(["planner", "sql_generator", "sql_guard"])
+        graph = self._build_graph()
+        final = await graph.ainvoke({"question": question, "attempt": 0, "pipeline": []})
+        return TextToSQLResult(
+            answer=final.get("answer", ""),
+            sql=final.get("sql", ""),
+            rows=final.get("rows", []),
+            columns=final.get("columns", []),
+            debug={
+                "selected_tables": final.get("selected_tables", []),
+                "pipeline": final.get("pipeline", []),
+                "plan": final.get("plan", ""),
+                "repair_error": final.get("last_error"),
+            },
+        )
 
-        debug["plan"] = plan
-        rows: list[dict[str, Any]] = []
-        columns: list[str] = []
-        error: str | None = None
+    def _build_graph(self):
+        service = self
+        max_rows = self.settings.max_sql_rows
 
-        for attempt in range(2):
-            try:
-                rows, columns, sql = self._execute(sql)
-                if "execute_sql" not in debug["pipeline"]:
-                    debug["pipeline"].append("execute_sql")
-                if rows or attempt == 1 or _should_keep_empty_result(question, sql):
+        async def build_sql(state: T2SState) -> dict[str, Any]:
+            question = state["question"]
+            knowledge = extract_knowledge(question)
+            selected_schema = select_schema(question)
+            deterministic_sql = _deterministic_sql(question, max_rows)
+            if deterministic_sql:
+                return {
+                    "knowledge": knowledge.as_prompt(),
+                    "selected_tables": selected_schema.tables,
+                    "plan": "Use deterministic SQL for the clearly recognized finance metric.",
+                    "sql": deterministic_sql,
+                    "candidates": [deterministic_sql],
+                    "pipeline": ["load_schema", "knowledge_extractor", "schema_selector", "deterministic_sql"],
+                }
+            plan = await service._plan(question, selected_schema, knowledge)
+            candidates = await service._generate_candidates(question, selected_schema, plan, knowledge)
+            return {
+                "knowledge": knowledge.as_prompt(),
+                "selected_tables": selected_schema.tables,
+                "plan": plan,
+                "sql": candidates[0],
+                "candidates": candidates,
+                "pipeline": [
+                    "load_schema",
+                    "knowledge_extractor",
+                    "schema_selector",
+                    "planner",
+                    "candidate_generator",
+                    "sql_guard",
+                ],
+            }
+
+        def execute(state: T2SState) -> dict[str, Any]:
+            candidates = state.get("candidates") or ([state["sql"]] if state.get("sql") else [])
+            multi = len(candidates) > 1
+            best: tuple[tuple[int, int], list[dict[str, Any]], list[str], str] | None = None
+            last_error: str | None = None
+            for candidate in candidates:
+                try:
+                    rows, columns, sql = service._execute(candidate)
+                except (SQLValidationError, SQLAlchemyError) as exc:
+                    service.db.rollback()
+                    last_error = str(exc)
+                    if not multi:
+                        break
+                    continue
+                # Execute-based score: prefer queries that return rows, then shorter/cleaner SQL.
+                score = (2 if rows else 1, -len(sql))
+                if best is None or score > best[0]:
+                    best = (score, rows, columns, sql)
+                if not multi:
                     break
-                debug["pipeline"].append("repair_empty_result")
-                sql = await self._repair_sql(
-                    question,
-                    selected_schema,
-                    bad_sql=sql,
-                    error="Query executed successfully but returned no rows.",
-                )
-            except (SQLValidationError, SQLAlchemyError) as exc:
-                error = str(exc)
-                self.db.rollback()
-                if attempt == 1:
-                    raise
-                debug["pipeline"].append("repair_sql_error")
-                sql = await self._repair_sql(question, selected_schema, bad_sql=sql, error=error)
+            if best is None:
+                message = last_error or "SQL execution returned no usable candidate"
+                return {"error": message, "last_error": message}
+            _score, rows, columns, sql = best
+            pipeline: list[str] = []
+            if multi and "candidate_selector" not in state.get("pipeline", []):
+                pipeline.append("candidate_selector")
+            if "execute_sql" not in state.get("pipeline", []):
+                pipeline.append("execute_sql")
+            return {"rows": rows, "columns": columns, "sql": sql, "error": None, "pipeline": pipeline}
 
-        debug["repair_error"] = error
-        answer = _sanitize_answer(await self._explain(question, sql, rows))
-        debug["pipeline"].append("explainer")
-        return TextToSQLResult(answer=answer, sql=sql, rows=rows, columns=columns, debug=debug)
+        def route_after_execute(state: T2SState) -> str:
+            if state.get("error"):
+                return "fail" if state.get("attempt", 0) >= 1 else "repair_error"
+            rows = state.get("rows") or []
+            if (
+                not rows
+                and state.get("attempt", 0) < 1
+                and not _should_keep_empty_result(state["question"], state["sql"])
+            ):
+                return "repair_empty"
+            return "explain"
 
-    async def _plan(self, question: str, selected_schema: SelectedSchema) -> str:
+        async def repair_error(state: T2SState) -> dict[str, Any]:
+            selected_schema = select_schema(state["question"])
+            sql = await service._repair_sql(
+                state["question"], selected_schema, bad_sql=state["sql"], error=state.get("error") or ""
+            )
+            return {
+                "sql": sql,
+                "candidates": [sql],
+                "attempt": state.get("attempt", 0) + 1,
+                "error": None,
+                "pipeline": ["repair_sql_error"],
+            }
+
+        async def repair_empty(state: T2SState) -> dict[str, Any]:
+            selected_schema = select_schema(state["question"])
+            sql = await service._repair_sql(
+                state["question"],
+                selected_schema,
+                bad_sql=state["sql"],
+                error="Query executed successfully but returned no rows.",
+            )
+            return {
+                "sql": sql,
+                "candidates": [sql],
+                "attempt": state.get("attempt", 0) + 1,
+                "pipeline": ["repair_empty_result"],
+            }
+
+        def fail(state: T2SState) -> dict[str, Any]:
+            raise RuntimeError(state.get("last_error") or "SQL execution failed")
+
+        async def explain(state: T2SState) -> dict[str, Any]:
+            answer = _sanitize_answer(
+                await service._explain(state["question"], state["sql"], state.get("rows") or [])
+            )
+            return {"answer": answer, "pipeline": ["explainer"]}
+
+        graph = StateGraph(T2SState)
+        graph.add_node("build_sql", build_sql)
+        graph.add_node("execute", execute)
+        graph.add_node("repair_error", repair_error)
+        graph.add_node("repair_empty", repair_empty)
+        graph.add_node("explain", explain)
+        graph.add_node("fail", fail)
+        graph.add_edge(START, "build_sql")
+        graph.add_edge("build_sql", "execute")
+        graph.add_conditional_edges(
+            "execute",
+            route_after_execute,
+            {
+                "repair_error": "repair_error",
+                "repair_empty": "repair_empty",
+                "explain": "explain",
+                "fail": "fail",
+            },
+        )
+        graph.add_edge("repair_error", "execute")
+        graph.add_edge("repair_empty", "execute")
+        graph.add_edge("explain", END)
+        graph.add_edge("fail", END)
+        return graph.compile()
+
+    async def _plan(self, question: str, selected_schema: SelectedSchema, knowledge: Knowledge | None = None) -> str:
         fallback = (
             "Join companies to the relevant finance table, filter tickers with upper-case symbols, "
             "choose the latest date when the question asks for current/latest values, and return a small result set."
         )
+        knowledge_block = f"\n\nExtracted knowledge:\n{knowledge.as_prompt()}" if knowledge and knowledge.as_prompt() else ""
         try:
             return await self.llm.chat(
                 [
@@ -95,7 +233,9 @@ class TextToSQLService:
                     ),
                     LLMMessage(
                         "user",
-                        f"Question:\n{question}\n\nAvailable schema:\n{selected_schema.schema_text}",
+                        f"Question:\n{question}\n\nAvailable schema:\n{generation_schema_text()}"
+                        f"\n\nMost relevant tables for this question: {', '.join(selected_schema.tables)}"
+                        f"{knowledge_block}",
                     ),
                 ],
                 temperature=0,
@@ -104,21 +244,34 @@ class TextToSQLService:
         except LLMError:
             return fallback
 
-    async def _generate_sql(self, question: str, selected_schema: SelectedSchema, plan: str) -> str:
-        deterministic_sql = _deterministic_sql(question, self.settings.max_sql_rows)
-        if deterministic_sql:
-            return ensure_limit(validate_select_sql(deterministic_sql), self.settings.max_sql_rows)
+    async def _generate_candidates(
+        self,
+        question: str,
+        selected_schema: SelectedSchema,
+        plan: str,
+        knowledge: Knowledge | None = None,
+        count: int = CANDIDATE_COUNT,
+    ) -> list[str]:
+        """Generate up to `count` distinct candidate SELECT queries in a single LLM call.
 
+        Returns validated, LIMIT-capped SQL strings; falls back to a heuristic query if the
+        LLM is unavailable or every candidate fails validation.
+        """
+        knowledge_block = (
+            f"\n\nExtracted knowledge:\n{knowledge.as_prompt()}" if knowledge and knowledge.as_prompt() else ""
+        )
         try:
-            sql = await self.llm.chat(
+            raw = await self.llm.chat(
                 [
                     LLMMessage(
                         "system",
                         "\n".join(
                             [
                                 "You generate safe PostgreSQL SELECT queries for a finance database.",
-                                "Return SQL only. No prose.",
-                                "Rules:",
+                                f"Propose {count} DISTINCT candidate queries that each fully answer the question.",
+                                "Vary the approach across candidates (e.g. window functions vs CTE vs aggregation) so a selector can pick the best.",
+                                "Output ONLY the SQL, each candidate in its own ```sql fenced block. No prose.",
+                                "Rules for every candidate:",
                                 "- Use only the provided tables and columns.",
                                 "- Never write INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, COPY.",
                                 "- For ticker filters, compare c.ticker to uppercase literals.",
@@ -131,15 +284,31 @@ class TextToSQLService:
                     ),
                     LLMMessage(
                         "user",
-                        f"Question:\n{question}\n\nSchema:\n{selected_schema.schema_text}\n\nPlan:\n{plan}",
+                        f"Question:\n{question}\n\nSchema:\n{generation_schema_text()}"
+                        f"\n\nMost relevant tables for this question: {', '.join(selected_schema.tables)}"
+                        f"{knowledge_block}"
+                        f"\n\nPlan:\n{plan}",
                     ),
                 ],
-                temperature=0,
-                max_tokens=800,
+                temperature=0.3,
+                max_tokens=1600,
             )
-            return ensure_limit(validate_select_sql(sql), self.settings.max_sql_rows)
-        except (LLMError, SQLValidationError):
-            return self._fallback_sql(question)
+        except LLMError:
+            return [self._fallback_sql(question)]
+
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for raw_sql in _parse_sql_candidates(raw):
+            try:
+                safe = ensure_limit(validate_select_sql(raw_sql), self.settings.max_sql_rows)
+            except SQLValidationError:
+                continue
+            if safe not in seen:
+                seen.add(safe)
+                candidates.append(safe)
+            if len(candidates) >= count:
+                break
+        return candidates or [self._fallback_sql(question)]
 
     async def _repair_sql(
         self,
@@ -161,7 +330,8 @@ class TextToSQLService:
                         "\n\n".join(
                             [
                                 f"Question:\n{question}",
-                                f"Schema:\n{selected_schema.schema_text}",
+                                f"Schema:\n{generation_schema_text()}",
+                                f"Most relevant tables: {', '.join(selected_schema.tables)}",
                                 f"Bad SQL:\n{bad_sql}",
                                 f"Error or issue:\n{error}",
                             ]
@@ -433,6 +603,22 @@ class TextToSQLService:
         )
 
 
+def _parse_sql_candidates(raw: str) -> list[str]:
+    """Split an LLM response into candidate SQL strings.
+
+    Prefers ```sql fenced blocks; falls back to treating the whole response as one query.
+    """
+    blocks = re.findall(r"```(?:sql)?\s*(.*?)```", raw, flags=re.IGNORECASE | re.DOTALL)
+    if not blocks:
+        blocks = [raw]
+    candidates: list[str] = []
+    for block in blocks:
+        cleaned = clean_sql(block)
+        if cleaned:
+            candidates.append(cleaned)
+    return candidates
+
+
 def _ticker_filter(tickers: list[str], column: str) -> str:
     condition = _ticker_condition(tickers, column)
     return f"WHERE {condition} " if condition else ""
@@ -518,6 +704,18 @@ def _exact_ohlc_sql(question: str, max_limit: int) -> str | None:
             f"ORDER BY p.date ASC, c.ticker ASC LIMIT {limit}"
         )
     limit = min(max(len(tickers), 1), max_limit)
+    if _asks_for_nearest_day(question):
+        return (
+            "SELECT ticker, name, date, open, high, low, close, volume "
+            "FROM ("
+            " SELECT c.ticker, c.name, p.date, p.open, p.high, p.low, p.close, p.volume,"
+            f" ROW_NUMBER() OVER (PARTITION BY c.ticker ORDER BY ABS(p.date - DATE '{exact_date}') ASC, p.date ASC) AS rn"
+            " FROM companies c JOIN prices p ON p.company_id = c.id"
+            f" WHERE {ticker_filter}"
+            f" AND p.date BETWEEN DATE '{exact_date}' - INTERVAL '10 days' AND DATE '{exact_date}' + INTERVAL '10 days'"
+            " ) nearest_day "
+            f"WHERE rn = 1 ORDER BY ticker ASC LIMIT {limit}"
+        )
     return (
         "SELECT c.ticker, c.name, p.date, p.open, p.high, p.low, p.close, p.volume "
         "FROM companies c JOIN prices p ON p.company_id = c.id "
@@ -1323,6 +1521,26 @@ def _asks_for_ohlc(question: str) -> bool:
     return len(requested_terms) >= 2 or "ohlc" in normalized
 
 
+def _asks_for_nearest_day(question: str) -> bool:
+    normalized = _normalize_text(_latest_user_question(question).lower())
+    return any(
+        phrase in normalized
+        for phrase in [
+            "ngay gan do",
+            "ngay gan day",
+            "ngay gan nhat",
+            "gan nhat neu",
+            "gan do neu",
+            "khong co du lieu",
+            "khong co phien",
+            "neu khong co",
+            "nearest",
+            "closest",
+            "nearby",
+        ]
+    )
+
+
 def _asks_for_latest_volume(question: str) -> bool:
     normalized = _normalize_text(question.lower())
     has_volume = any(phrase in normalized for phrase in ["volume", "khoi luong", "giao dich"])
@@ -1641,7 +1859,16 @@ def _deterministic_exact_ohlc_explanation(question: str, rows: list[dict[str, An
             ]
         )
 
-    lines = ["Đã lấy dữ liệu OHLC đúng theo ngày được hỏi.", "", "### Kết quả"]
+    requested_date = _requested_exact_date(question)
+    nearest_mode = _asks_for_nearest_day(question)
+    used_nearest = nearest_mode and requested_date is not None and any(
+        str(row.get("date"))[:10] != requested_date for row in rows
+    )
+    if used_nearest:
+        header = f"Ngày {requested_date} không có phiên giao dịch nên đã lấy phiên gần nhất."
+    else:
+        header = "Đã lấy dữ liệu OHLC đúng theo ngày được hỏi."
+    lines = [header, "", "### Kết quả"]
     for row in sorted(rows, key=lambda item: str(item.get("ticker", ""))):
         lines.append(
             "- {ticker} ngày {date}: open {open}, high {high}, low {low}, close {close}{volume}.".format(
@@ -1654,7 +1881,10 @@ def _deterministic_exact_ohlc_explanation(question: str, rows: list[dict[str, An
                 volume=f", volume {_format_integer(row.get('volume'))}" if _is_number(row.get("volume")) else "",
             )
         )
-    lines.extend(["", "### Lưu ý", "- Truy vấn dùng điều kiện ngày chính xác, không lấy ngày gần nhất thay thế."])
+    if used_nearest:
+        lines.extend(["", "### Lưu ý", f"- {requested_date} là ngày nghỉ/không có dữ liệu; bảng hiển thị phiên giao dịch gần nhất."])
+    else:
+        lines.extend(["", "### Lưu ý", "- Truy vấn dùng điều kiện ngày chính xác, không lấy ngày gần nhất thay thế."])
     return "\n".join(lines)
 
 

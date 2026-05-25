@@ -16,6 +16,7 @@ dependencies = [
   "yfinance>=0.2.40",
   "feedparser>=6.0.11",
   "sqlglot>=25.0.0",
+  "langgraph>=0.2.0",
 ]
 
 [project.optional-dependencies]

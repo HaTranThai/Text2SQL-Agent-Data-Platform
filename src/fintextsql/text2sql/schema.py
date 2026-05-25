@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 FINANCE_TABLES = {
     "companies": [
@@ -67,16 +68,48 @@ FINANCE_TABLES = {
 }
 
 
+SCHEMA_RELATIONSHIPS = [
+    "prices.company_id -> companies.id (a company has many daily price rows)",
+    "fundamentals.company_id -> companies.id (point-in-time valuation rows per company)",
+    "news_articles.ticker -> companies.ticker (join by uppercase ticker text, NOT by id)",
+]
+
+SCHEMA_RULES = [
+    "Only these 5 tables and their listed columns exist. Never reference any other table or column.",
+    "To filter a stock, join companies c and compare c.ticker to uppercase literals, e.g. c.ticker = 'AAPL'.",
+    "prices has one row per company per trading day (open, high, low, close, adj_close, volume).",
+    "fundamentals is point-in-time; pick the latest as_of_date when a current metric is asked.",
+    "date and as_of_date are real DATE columns; use date filters like p.date >= CURRENT_DATE - INTERVAL '30 days'.",
+    "news_articles.ticker is plain text; join news to companies on c.ticker = news_articles.ticker.",
+]
+
+
 @dataclass(slots=True)
 class SelectedSchema:
     tables: list[str]
     schema_text: str
 
 
+@lru_cache(maxsize=1)
 def full_schema_text() -> str:
     return "\n\n".join(_format_table(table, columns) for table, columns in FINANCE_TABLES.items())
 
 
+@lru_cache(maxsize=1)
+def generation_schema_text() -> str:
+    """Full schema plus relationships and rules, used when generating or repairing SQL."""
+    relationships = "\n".join(f"  - {item}" for item in SCHEMA_RELATIONSHIPS)
+    rules = "\n".join(f"  - {item}" for item in SCHEMA_RULES)
+    return "\n\n".join(
+        [
+            full_schema_text(),
+            f"relationships:\n{relationships}",
+            f"rules:\n{rules}",
+        ]
+    )
+
+
+@lru_cache(maxsize=256)
 def select_schema(question: str) -> SelectedSchema:
     question_l = question.lower()
     tables: set[str] = {"companies"}
