@@ -59,7 +59,7 @@ Các luồng chính:
 
 | Luồng | Mục đích |
 | --- | --- |
-| `text_to_sql` | Sinh SQL, validate, chạy query, repair nếu lỗi, giải thích kết quả |
+| `text_to_sql` | Pipeline LangGraph: trích tri thức, chọn schema, sinh nhiều SQL ứng viên, chọn câu tốt nhất, validate, chạy, repair nếu lỗi, giải thích |
 | `visualization` | Sinh dữ liệu và chọn loại biểu đồ phù hợp |
 | `news` | Lấy, lọc, dịch và phân tích tin tức tài chính |
 | `ingestion` | Nạp dữ liệu giá, fundamentals, news vào Postgres |
@@ -82,6 +82,27 @@ React/Vite Frontend
   -> yfinance / RSS providers
 ```
 
+### Pipeline Text-to-SQL (LangGraph)
+
+Luồng `text_to_sql` được điều phối bằng một `StateGraph` của LangGraph:
+
+```text
+Knowledge Extractor   (trích ticker, khung thời gian, từ điển domain)
+  -> Schema Cache      (cache schema tĩnh + chọn bảng — lru_cache)
+  -> Schema Selector
+  -> Planner
+  -> Candidate Generator x3   (sinh 3 SQL ứng viên trong 1 lần gọi LLM)
+  -> Candidate Selector       (execute-based: hợp lệ + có rows + SQL gọn)
+  -> SQL Guard (read-only)
+  -> Execute
+       -> empty / error -> Repair (lặp tối đa 2 lần) -> Execute
+       -> ok            -> Explainer
+```
+
+Với các câu hỏi phổ biến đã nhận diện rõ (vd % thay đổi N ngày, market cap,
+drawdown, MA, correlation, beta), hệ thống dùng **deterministic SQL** thay vì để
+LLM tự đoán, nên bỏ qua bước sinh ứng viên và trả kết quả gần như tức thì.
+
 Các module quan trọng:
 
 | Module | Vai trò |
@@ -89,9 +110,10 @@ Các module quan trọng:
 | `fintextsql.api.main` | Khai báo API, quản lý session context, điều phối request |
 | `fintextsql.core.intent` | Phân loại intent từ câu hỏi |
 | `fintextsql.core.tickers` | Trích xuất ticker từ câu hỏi |
-| `fintextsql.text2sql.service` | Pipeline Text-to-SQL, deterministic SQL, giải thích kết quả |
+| `fintextsql.text2sql.service` | Pipeline Text-to-SQL (LangGraph), deterministic SQL, sinh/chọn SQL ứng viên, giải thích kết quả |
+| `fintextsql.text2sql.knowledge` | Trích ticker, khung thời gian và từ điển domain (MA, return, volatility, drawdown, beta, correlation, 52-tuần, P/E) |
 | `fintextsql.text2sql.sql_guard` | Validate SQL read-only và whitelist bảng |
-| `fintextsql.text2sql.schema` | Mô tả schema và chọn bảng liên quan |
+| `fintextsql.text2sql.schema` | Mô tả schema (có cache), quan hệ bảng, rules và chọn bảng liên quan |
 | `fintextsql.ingestion.yfinance_service` | Nạp dữ liệu từ yfinance |
 | `fintextsql.paths.news.service` | Lấy tin tức, dịch headline, phân tích và gắn link nguồn |
 | `fintextsql.paths.visualization.service` | Suy luận loại chart, trục X/Y, series |
@@ -128,7 +150,7 @@ Vì SQL có thể được sinh bởi LLM, hệ thống có các giới hạn an
 | Lớp | Công nghệ |
 | --- | --- |
 | Frontend | React, TypeScript, Vite, Recharts, lucide-react |
-| Backend | FastAPI, Pydantic, SQLAlchemy |
+| Backend | FastAPI, Pydantic, SQLAlchemy, LangGraph |
 | Database | PostgreSQL 16 |
 | Data Provider | yfinance, Yahoo Finance RSS, Google News RSS |
 | LLM | OpenAI-compatible Chat Completions API |
