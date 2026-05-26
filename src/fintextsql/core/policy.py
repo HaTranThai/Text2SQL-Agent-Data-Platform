@@ -66,9 +66,16 @@ class PolicyGuard:
                 "nen ban",
                 "mua ma nao",
                 "ma nao de mua",
+                "ma nao nen mua",
+                "ngon nhat de mua",
+                "ma ngon",
+                "chon ma nao de mua",
+                "mua ma gi",
+                "nen dau tu vao ma",
                 "khuyen nghi mua",
                 "buy recommendation",
                 "should i buy",
+                "what should i buy",
             ],
         ):
             return PolicyDecision(

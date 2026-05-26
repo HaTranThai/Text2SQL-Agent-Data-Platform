@@ -185,7 +185,16 @@ class TextToSQLService:
             }
 
         def fail(state: T2SState) -> dict[str, Any]:
-            raise RuntimeError(state.get("last_error") or "SQL execution failed")
+            # Repair exhausted: return a friendly message instead of raising a 500.
+            return {
+                "answer": (
+                    "Xin lỗi, mình chưa tạo được truy vấn SQL hợp lệ cho câu hỏi này. "
+                    "Bạn thử diễn đạt cụ thể hơn (mã cổ phiếu, khoảng thời gian, chỉ số cần xem) giúp mình nhé."
+                ),
+                "rows": [],
+                "columns": [],
+                "pipeline": ["fail_handler"],
+            }
 
         async def explain(state: T2SState) -> dict[str, Any]:
             answer = _sanitize_answer(
@@ -381,6 +390,9 @@ class TextToSQLService:
         deterministic_aggregate = _deterministic_aggregate_explanation(question, rows)
         if deterministic_aggregate:
             return deterministic_aggregate
+        deterministic_up_sessions = _deterministic_up_sessions_explanation(question, rows)
+        if deterministic_up_sessions:
+            return deterministic_up_sessions
         deterministic_streak = _deterministic_streak_explanation(question, rows)
         if deterministic_streak:
             return deterministic_streak
@@ -662,6 +674,7 @@ def _deterministic_sql(question: str, max_limit: int) -> str | None:
         or _top_volume_sql(question, max_limit)
         or _lowest_volume_sql(question, max_limit)
         or _latest_volume_sql(question, max_limit)
+        or _count_up_sessions_sql(question, max_limit)
         or _longest_down_streak_sql(question, max_limit)
         or _correlation_sql(question, max_limit)
         or _ma_screen_sql(question, max_limit)
@@ -888,6 +901,49 @@ def _volume_date_vs_quarter_max_sql(question: str, max_limit: int) -> str | None
         " ROUND((((t.target_volume - q.quarter_max_volume)::numeric / NULLIF(q.quarter_max_volume, 0)) * 100), 2)::float AS pct_vs_quarter_max"
         " FROM quarter_max q LEFT JOIN target_day t ON t.ticker = q.ticker"
         f" ORDER BY q.ticker ASC LIMIT {limit}"
+    )
+
+
+def _count_up_sessions_sql(question: str, max_limit: int) -> str | None:
+    """Count how many sessions a ticker rose/fell (vs prior close, or close vs open) in a window."""
+    tickers = _context_tickers(question) or extract_tickers(question)
+    normalized = _normalize_text(_latest_user_question(question).lower())
+    if not tickers:
+        return None
+    if not (re.search(r"bao nhieu (phien|ngay)", normalized) or "so phien" in normalized):
+        return None
+    ticker_filter = _ticker_condition(tickers, "c.ticker")
+    if not ticker_filter:
+        return None
+
+    if "cao hon mo cua" in normalized or ("dong cua" in normalized and "mo cua" in normalized):
+        condition = "close > open"
+    elif "giam" in normalized:
+        condition = "close < prev_close"
+    else:
+        condition = "close > prev_close"
+
+    sessions = _requested_session_count(question)
+    if sessions and "phien" in normalized:
+        date_filter = ""
+        window_filter = f"WHERE rn <= {sessions}"
+    else:
+        days = _requested_window_days(question) or 30
+        date_filter = f" AND p.date >= CURRENT_DATE - INTERVAL '{days} days'"
+        window_filter = ""
+    limit = min(max(len(tickers), 1), max_limit)
+    return (
+        "WITH base AS ("
+        " SELECT c.ticker, c.name, p.date, p.open, p.close,"
+        " LAG(p.close) OVER (PARTITION BY c.ticker ORDER BY p.date) AS prev_close,"
+        " ROW_NUMBER() OVER (PARTITION BY c.ticker ORDER BY p.date DESC) AS rn"
+        " FROM companies c JOIN prices p ON p.company_id = c.id"
+        f" WHERE {ticker_filter}{date_filter}"
+        ") SELECT ticker, name,"
+        f" COUNT(*) FILTER (WHERE {condition}) AS matching_sessions,"
+        " COUNT(*) AS total_sessions"
+        f" FROM base {window_filter} "
+        f"GROUP BY ticker, name ORDER BY ticker ASC LIMIT {limit}"
     )
 
 
@@ -1191,7 +1247,7 @@ def _volume_price_correlation_sql(question: str, max_limit: int) -> str | None:
 def _month_price_data_sql(question: str, max_limit: int) -> str | None:
     tickers = _context_tickers(question) or extract_tickers(question)
     month_window = _requested_month_window(question)
-    if not tickers or not month_window or not _asks_for_month_price_data(question):
+    if not tickers or not month_window or not _asks_for_month_price_data(question) or _should_defer_to_llm(question):
         return None
     start_date, end_date = month_window
     ticker_filter = _ticker_condition(tickers, "c.ticker")
@@ -1210,7 +1266,7 @@ def _month_price_data_sql(question: str, max_limit: int) -> str | None:
 def _month_close_sql(question: str, max_limit: int) -> str | None:
     tickers = _context_tickers(question) or extract_tickers(question)
     month_window = _requested_month_window(question)
-    if not tickers or not month_window or not _asks_for_month_close(question):
+    if not tickers or not month_window or not _asks_for_month_close(question) or _should_defer_to_llm(question):
         return None
     start_date, end_date = month_window
     ticker_filter = _ticker_condition(tickers, "c.ticker")
@@ -1233,7 +1289,13 @@ def _latest_close_sql(question: str, max_limit: int) -> str | None:
         return None
     has_close = any(phrase in normalized for phrase in ["gia dong cua", "close", "closing price"])
     has_latest = any(phrase in normalized for phrase in ["gan nhat", "latest", "recent", "last"])
-    if not has_close or not has_latest or _asks_for_high_close(question) or _asks_for_price_change(question_l):
+    if (
+        not has_close
+        or not has_latest
+        or _asks_for_high_close(question)
+        or _asks_for_price_change(question_l)
+        or _should_defer_to_llm(question)
+    ):
         return None
     days = _requested_window_days(question)
     sessions = _requested_session_count(question)
@@ -1454,7 +1516,12 @@ def _monthly_high_close_sql(question: str, max_limit: int) -> str | None:
 
 def _high_close_sql(question: str, max_limit: int) -> str | None:
     tickers = _context_tickers(question) or extract_tickers(question)
-    if not tickers or not _asks_for_high_close(question) or _asks_for_monthly_high_close(question):
+    if (
+        not tickers
+        or not _asks_for_high_close(question)
+        or _asks_for_monthly_high_close(question)
+        or _should_defer_to_llm(question)
+    ):
         return None
     days = _requested_window_days(question) or 31 * 8
     ticker_filter = _ticker_condition(tickers, "c.ticker")
@@ -1476,7 +1543,7 @@ def _high_close_sql(question: str, max_limit: int) -> str | None:
 def _price_series_sql(question: str, max_limit: int) -> str | None:
     tickers = _context_tickers(question) or extract_tickers(question)
     question_l = question.lower()
-    if not tickers or not _asks_for_price_series(question_l):
+    if not tickers or not _asks_for_price_series(question_l) or _should_defer_to_llm(question):
         return None
 
     days = _requested_window_days(question) or 30
@@ -1490,6 +1557,35 @@ def _price_series_sql(question: str, max_limit: int) -> str | None:
         f"WHERE {ticker_filter} AND p.date >= CURRENT_DATE - INTERVAL '{days} days' "
         f"ORDER BY p.date ASC, c.ticker ASC LIMIT {limit}"
     )
+
+
+def _asks_for_average(question: str) -> bool:
+    normalized = _normalize_text(question.lower())
+    return any(phrase in normalized for phrase in ["trung binh", "average", "avg", "binh quan"])
+
+
+def _should_defer_to_llm(question: str) -> bool:
+    """True when a question needs computation (count / average / single-day extreme move /
+    up-down vs previous session) that the simple price/volume series builders cannot answer,
+    so it should fall through to the LLM candidate generator instead of a raw series dump.
+    """
+    normalized = _normalize_text(_latest_user_question(question).lower())
+    if _asks_for_average(question):
+        return True
+    if re.search(r"bao nhieu (phien|ngay|lan|buoi)", normalized) or "so phien" in normalized:
+        return True
+    if (
+        "manh nhat" in normalized
+        and ("tang" in normalized or "giam" in normalized)
+        and "cao nhat" not in normalized
+        and "thap nhat" not in normalized
+    ):
+        return True
+    if "so voi phien truoc" in normalized and any(
+        token in normalized for token in ["tang", "giam", "liet ke", "cac ngay", "ngay nao"]
+    ):
+        return True
+    return False
 
 
 def _asks_for_quarterly_close_comparison(question: str) -> bool:
@@ -1545,7 +1641,8 @@ def _asks_for_latest_volume(question: str) -> bool:
     normalized = _normalize_text(question.lower())
     has_volume = any(phrase in normalized for phrase in ["volume", "khoi luong", "giao dich"])
     has_latest = any(phrase in normalized for phrase in ["gan nhat", "latest", "recent", "last", "moi nhat"])
-    return has_volume and has_latest
+    # "volume trung bình ..." is an aggregate, not a recent-sessions dump → let the LLM handle it.
+    return has_volume and has_latest and not _asks_for_average(question)
 
 
 def _asks_for_lowest_volume(question: str) -> bool:
@@ -2053,6 +2150,24 @@ def _deterministic_lowest_volume_explanation(question: str, rows: list[dict[str,
     for row in sorted(usable, key=lambda item: (str(item.get("ticker")), float(item["volume"]))):
         lines.append(f"- {row['ticker']}: {str(row['date'])[:10]}, volume {_format_integer(row['volume'])}.")
     lines.extend(["", "### Lưu ý", "- Kết quả được tính từ cột `volume`, không dùng giá đóng cửa thay thế."])
+    return "\n".join(lines)
+
+
+def _deterministic_up_sessions_explanation(question: str, rows: list[dict[str, Any]]) -> str | None:
+    if not rows or not {"matching_sessions", "total_sessions"}.issubset(rows[0]):
+        return None
+    normalized = _normalize_text(_latest_user_question(question).lower())
+    if "cao hon mo cua" in normalized or ("dong cua" in normalized and "mo cua" in normalized):
+        label = "có giá đóng cửa cao hơn giá mở cửa"
+    elif "giam" in normalized:
+        label = "giảm giá so với phiên trước"
+    else:
+        label = "tăng giá so với phiên trước"
+    lines = ["### Số phiên thỏa điều kiện"]
+    for row in rows:
+        matching = _format_integer(row.get("matching_sessions"))
+        total = _format_integer(row.get("total_sessions"))
+        lines.append(f"- {row.get('ticker')}: {matching}/{total} phiên {label}.")
     return "\n".join(lines)
 
 
