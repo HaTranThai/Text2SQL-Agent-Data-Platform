@@ -21,7 +21,7 @@ RSS_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; FinTextSQL/0.1; +https://localhost)",
     "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
-NEWS_ANALYSIS_TIMEOUT_SECONDS = 12
+NEWS_ANALYSIS_TIMEOUT_SECONDS = 20
 NEWS_FETCH_TIMEOUT_SECONDS = 8
 
 
@@ -58,38 +58,39 @@ class NewsService:
                         [
                             LLMMessage(
                                 "system",
-                                (
-                                    "You are a finance news analyst. Answer in Vietnamese like a normal chatbot. "
-                                    "Use only the provided article titles/summaries. Do not invent prices, ratings, "
-                                    "or facts not present in the articles. Translate article titles into Vietnamese "
-                                    "when you mention them. When mentioning a specific article, write the Vietnamese "
-                                    "title as plain text, then put a short Markdown source link immediately after it. "
-                                    "Do not use generic filler like 'Tin từ ...: nhu cầu AI và triển vọng ngành'. "
-                                    "Be concise, specific, and analytical."
+                                "\n".join(
+                                    [
+                                        "Bạn là chuyên gia phân tích tin tức tài chính, trả lời bằng tiếng Việt tự nhiên.",
+                                        "Chỉ dùng tiêu đề/tóm tắt được cung cấp; KHÔNG bịa giá, rating hay sự kiện không có trong bài.",
+                                        "Với MỖI bài được nhắc tới, tự phân loại tâm lý: 📈 tích cực / 📉 tiêu cực / ➖ trung tính,",
+                                        "dựa trên nội dung bài (có thể tham khảo sentiment_hint nhưng tự đánh giá lại nếu thấy chưa đúng).",
+                                        "Dịch tiêu đề sang tiếng Việt; không để nguyên tiêu đề tiếng Anh.",
+                                        "Tránh câu sáo rỗng lặp lại; mỗi bài một takeaway cụ thể.",
+                                        "Trả lời ĐÚNG theo cấu trúc Markdown sau:",
+                                        "**Tổng quan:** 1-2 câu kèm tâm lý chung (tích cực/tiêu cực/trái chiều).",
+                                        "### Tin nổi bật",
+                                        "- <icon> **<tựa tiếng Việt>** [<Publisher>](<url>) — <một takeaway cụ thể> (<tâm lý>)",
+                                        "### Tác động tiềm năng",
+                                        "- các gạch đầu dòng ngắn gọn về ảnh hưởng tới mã/ngành",
+                                        "### Lưu ý",
+                                        "- nhắc đây là phân tích từ tiêu đề RSS, không phải khuyến nghị mua bán",
+                                    ]
                                 ),
                             ),
                             LLMMessage(
                                 "user",
                                 "\n\n".join(
                                     [
-                                        f"User question: {question}",
-                                        f"Ticker/topic: {ticker or 'market'}",
-                                        "Articles:",
+                                        f"Câu hỏi người dùng: {question}",
+                                        f"Mã/chủ đề: {ticker or 'thị trường chung'}",
+                                        "Danh sách bài viết (kèm sentiment_hint gợi ý):",
                                         _articles_context(articles),
-                                        (
-                                            "Write an answer with: 1) short overview, 2) key themes, "
-                                            "3) likely implications for the ticker/topic, 4) caveats. "
-                                            "Mention the most relevant publishers briefly. Do not output English "
-                                            "headlines verbatim; translate them into Vietnamese first. Avoid repeating "
-                                            "the same sentence structure across articles. In the key article list, use "
-                                            "this format: Vietnamese title [Publisher](article URL) - one specific takeaway."
-                                        ),
                                     ]
                                 ),
                             ),
                         ],
                         temperature=0.2,
-                        max_tokens=700,
+                        max_tokens=900,
                     ),
                     timeout=NEWS_ANALYSIS_TIMEOUT_SECONDS,
                 )
@@ -179,21 +180,25 @@ class NewsService:
 
     def _feed_urls(self, ticker: str | None) -> list[tuple[str, str]]:
         if ticker:
-            query = quote(f"{ticker} stock when:14d")
+            # Build a query with ticker + company name so Google News returns on-topic articles.
+            names = sorted(alias for alias in _ticker_aliases(ticker) if alias != ticker.lower())
+            terms = " OR ".join([ticker, *[name.title() for name in names]]) if names else ticker
+            query = quote(f"({terms}) stock when:14d")
             return [
+                # Google News first: more reliable ticker-specific coverage than Yahoo's generic headline feed.
+                (f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en", "google_news_rss"),
                 (
                     "https://feeds.finance.yahoo.com/rss/2.0/headline"
                     f"?s={quote(ticker)}&region=US&lang=en-US",
                     "yahoo_finance_rss",
                 ),
-                (f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en", "google_news_rss"),
             ]
         return [
-            ("https://finance.yahoo.com/news/rssindex", "yahoo_finance_rss"),
             (
                 "https://news.google.com/rss/search?q=stock%20market%20finance%20when:14d&hl=en-US&gl=US&ceid=US:en",
                 "google_news_rss",
             ),
+            ("https://finance.yahoo.com/news/rssindex", "yahoo_finance_rss"),
         ]
 
 
@@ -253,21 +258,32 @@ def _filter_relevant_articles(articles: list[dict[str, Any]], *, ticker: str | N
         for article in articles
         if any(alias in _article_text(article) for alias in aliases)
     ]
-    relevant = sorted(relevant, key=lambda article: _article_relevance_score(article, ticker=ticker), reverse=True)
+    relevant = sorted(
+        relevant,
+        key=lambda article: (_article_relevance_score(article, ticker=ticker), _published_sort_key(article)),
+        reverse=True,
+    )
     if len(relevant) >= 2:
         return relevant
     if relevant:
-        indirect = [article for article in articles if article not in relevant]
+        indirect = sorted(
+            (article for article in articles if article not in relevant),
+            key=_published_sort_key,
+            reverse=True,
+        )
         return [*relevant, *indirect[:2]]
-    return articles
+    return sorted(articles, key=_published_sort_key, reverse=True)
 
 
 def _article_relevance_score(article: dict[str, Any], *, ticker: str) -> int:
     text = _article_text(article)
+    title = str(article.get("title") or "").lower()
     score = 0
     for alias in _ticker_aliases(ticker):
         if alias in text:
             score += 5
+        if alias in title:
+            score += 6  # mentions in the headline are far more on-topic than in the body
     direct_terms = [
         "stock",
         "shares",
@@ -307,14 +323,57 @@ def _article_text(article: dict[str, Any]) -> str:
     return f"{article.get('title') or ''} {article.get('summary') or ''}".lower()
 
 
+_BULLISH_TERMS = [
+    "surge", "soar", "soars", "jump", "jumps", "rally", "rallies", "beat", "beats",
+    "record high", "record", "upgrade", "upgraded", "price target", "hikes", "raises",
+    "outperform", "gains", "gain", "rises", "rose", "higher", "tops", "wins", "boost",
+    "optimistic", "bullish", "cheap", "undervalued", "strong demand", "growth",
+    "all-time high", "top-notch", "winning streak",
+]
+_BEARISH_TERMS = [
+    "plunge", "plunges", "slump", "slumps", "tumble", "tumbles", "falls", "fell",
+    "drop", "drops", "miss", "misses", "downgrade", "downgraded", "cuts", "cut target",
+    "lawsuit", "probe", "investigation", "warning", "warns", "weak", "decline",
+    "declines", "bearish", "loss", "losses", "concern", "concerns", "cautious",
+    "stretched", "selloff", "sell-off", "slowdown", "layoff", "recall", "sanction", "ban",
+]
+
+
+def _article_sentiment(article: dict[str, Any]) -> tuple[str, str]:
+    """Lightweight keyword sentiment: returns (label_vi, icon)."""
+    text = _article_text(article)
+    bull = sum(1 for term in _BULLISH_TERMS if term in text)
+    bear = sum(1 for term in _BEARISH_TERMS if term in text)
+    if bull > bear:
+        return "tích cực", "📈"
+    if bear > bull:
+        return "tiêu cực", "📉"
+    return "trung tính", "➖"
+
+
+def _published_sort_key(article: dict[str, Any]) -> float:
+    value = article.get("published_at")
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
 def _articles_context(articles: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for index, article in enumerate(articles[:8], start=1):
+        label, icon = _article_sentiment(article)
         parts = [
             f"{index}. title: {article.get('title')}",
             f"url: {article.get('link')}",
-            f"publisher: {article.get('publisher') or article.get('source')}",
+            f"publisher: {_source_link_label(str(article.get('publisher') or article.get('source') or ''))}",
             f"published_at: {article.get('published_at') or 'unknown'}",
+            f"sentiment_hint: {icon} {label}",
         ]
         summary = str(article.get("summary") or "").strip()
         if summary:
@@ -331,7 +390,7 @@ def _fallback_news_analysis(*, ticker: str | None, articles: list[dict[str, Any]
 
     lines = [
         f"Mình tìm thấy {len(articles)} tin gần đây về {subject}. Chủ đề nổi bật là "
-        f"{_format_themes(themes)}.",
+        f"{_format_themes(themes)}. Tâm lý chung: {_overall_sentiment_label(articles)}.",
         "",
         "### Tin đáng chú ý",
     ]
@@ -481,7 +540,23 @@ def _translated_article_reference(article: dict[str, Any]) -> str:
 def _article_bullet(article: dict[str, Any], *, ticker: str | None) -> str:
     date_text = _article_date_label(article)
     date_suffix = f", {date_text}" if date_text else ""
-    return f"{_translated_article_reference(article)}{date_suffix}. {_article_vi_description(article, ticker=ticker)}"
+    label, icon = _article_sentiment(article)
+    return (
+        f"{icon} {_translated_article_reference(article)}{date_suffix}. "
+        f"{_article_vi_description(article, ticker=ticker)} (Tâm lý: {label})"
+    )
+
+
+def _overall_sentiment_label(articles: list[dict[str, Any]]) -> str:
+    counts = {"tích cực": 0, "tiêu cực": 0, "trung tính": 0}
+    for article in articles:
+        label, _ = _article_sentiment(article)
+        counts[label] += 1
+    if counts["tích cực"] and counts["tiêu cực"]:
+        if abs(counts["tích cực"] - counts["tiêu cực"]) <= 1:
+            return "trái chiều"
+    top = max(counts, key=lambda key: counts[key])
+    return top
 
 
 def _article_date_label(article: dict[str, Any]) -> str:
@@ -785,4 +860,8 @@ def _serialize_article(article: dict[str, Any]) -> dict[str, Any]:
     published = value.get("published_at")
     if isinstance(published, datetime):
         value["published_at"] = published.isoformat()
+    label, icon = _article_sentiment(article)
+    value["sentiment"] = label
+    value["sentiment_icon"] = icon
+    value["source_label"] = _source_link_label(str(article.get("publisher") or article.get("source") or ""))
     return value
