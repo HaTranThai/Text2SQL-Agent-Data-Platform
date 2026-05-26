@@ -26,6 +26,7 @@ from fintextsql.core.config import Settings, get_settings
 from fintextsql.core.intent import IntentRouter, RouteDecision
 from fintextsql.core.policy import PolicyDecision, PolicyGuard
 from fintextsql.core.planner import AgentPlan, PlannedTask, TaskPlanner
+from fintextsql.core.tickers import extract_tickers
 from fintextsql.db.models import Company
 from fintextsql.db.session import get_db, init_db
 from fintextsql.ingestion.yfinance_service import YFinanceIngestionService
@@ -110,6 +111,12 @@ async def chat(
     policy = PolicyGuard().check(payload.message)
     if policy.triggered:
         return _policy_chat_response(policy)
+
+    # Resolve context-borrowing follow-ups ("so nó với GOOG", "còn TSLA thì sao") into a
+    # self-contained question before routing/planning, so the same analysis applies.
+    resolved = _rewrite_follow_up(payload.session_id, payload.message)
+    if resolved and resolved != payload.message:
+        payload.message = resolved
 
     router = IntentRouter()
     agent_plan = TaskPlanner(SESSION_STATE.get(payload.session_id)).plan(payload.message)
@@ -939,6 +946,71 @@ def _format_profile_number(value: float) -> str:
     if abs(value) >= 1_000_000:
         return f"{value:,.0f}"
     return f"{value:,.4f}".rstrip("0").rstrip(".")
+
+
+_METRIC_TERMS = [
+    "gia", "close", "volume", "khoi luong", "market cap", "von hoa", "pe", "p/e", "beta",
+    "drawdown", "volatility", "bien dong", "correlation", "tuong quan", "return", "loi suat",
+    "ma20", "ma50", "ma200", "dinh 52", "52 tuan", "cao nhat", "thap nhat", "trung binh", "ohlc",
+    "tang", "giam", "rui ro",
+]
+
+
+def _has_metric_term(text_ascii: str) -> bool:
+    return any(term in text_ascii for term in _METRIC_TERMS)
+
+
+def _replace_tickers_in_text(text: str, old_tickers: list[str], target_tickers: list[str]) -> str | None:
+    """Replace the first old ticker with the target list, drop the rest. None if no literal match."""
+    target = ", ".join(target_tickers)
+    result = text
+    replaced = False
+    for ticker in old_tickers:
+        pattern = rf"\b{re.escape(ticker)}\b"
+        if re.search(pattern, result):
+            result = re.sub(pattern, target if not replaced else "", result, count=1)
+            replaced = True
+    if not replaced:
+        return None
+    return re.sub(r"\s+", " ", result).strip().strip(",").strip()
+
+
+def _rewrite_follow_up(session_id: str | None, message: str) -> str | None:
+    """Resolve a context-borrowing follow-up by rewriting the previous question.
+
+    Handles comparison ("so nó với GOOG" -> merge tickers) and continuation
+    ("còn TSLA thì sao" -> swap ticker), reusing the prior analysis/metric/window.
+    Returns None when the message is self-sufficient or not a follow-up.
+    """
+    if not session_id:
+        return None
+    prev = SESSION_MESSAGES.get(session_id)
+    if not prev:
+        return None
+    text = _strip_vietnamese_accents(message.lower())
+    if _has_metric_term(text):
+        return None  # the message already names its own metric -> not borrowing context
+    words = text.split()
+    is_compare = ("so" in words or "so sanh" in text or "doi chieu" in text or "vs" in words) and (
+        "voi" in words or "cung" in words or "vs" in words
+    )
+    is_continuation = any(
+        phrase in text for phrase in ["con ", "the con", "thi sao", "tuong tu", "con lai", "tiep theo"]
+    )
+    is_pronoun = any(phrase in text for phrase in ["cai do", "cai nay", "cai kia", "chung", "cac ma do"]) or "no" in words
+    if not (is_compare or is_continuation or is_pronoun):
+        return None
+    old_tickers = extract_tickers(prev)
+    if not old_tickers:
+        return None
+    new_tickers = extract_tickers(message)
+    if new_tickers:
+        target = _merge_tickers(old_tickers, new_tickers) if is_compare else new_tickers
+        rewritten = _replace_tickers_in_text(prev, old_tickers, target)
+        if rewritten:
+            return rewritten
+        return f"{prev} — áp dụng cho {', '.join(target)}"
+    return prev  # pronoun-only follow-up: reuse the previous question verbatim
 
 
 def _merge_tickers(previous: list[str], current: list[str]) -> list[str]:

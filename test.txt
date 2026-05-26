@@ -648,3 +648,78 @@ Mã nào ít rủi ro nhất?
 ```text
 Ticker nào chắc chắn tăng ngày mai?
 ```
+
+---
+
+## 14. Nhóm multi-turn / nối ngữ cảnh trong cùng session
+
+Nhóm này test khả năng **nhớ và nối câu trước** trong cùng một session chat. Mỗi khối là một
+**hội thoại nhiều lượt** (chạy lần lượt với cùng `session_id`). Kỳ vọng: câu sau biết kế thừa
+**mã, chỉ số, khoảng thời gian và loại phân tích** từ câu trước.
+
+### 14.1 So sánh — gộp thêm mã (merge)
+
+```text
+T1: Giá đóng cửa của AAPL trong 30 ngày gần nhất
+T2: nếu so nó với GOOG thì sao
+```
+Kỳ vọng T2: so sánh giá đóng cửa **AAPL và GOOG** trong 30 ngày (giữ chỉ số + khung thời gian).
+
+```text
+T1: Volatility lợi suất ngày của AAPL trong 1 năm gần nhất
+T2: so với MSFT thì sao
+```
+Kỳ vọng T2: so volatility **AAPL vs MSFT** trong 1 năm.
+
+### 14.2 Tiếp nối — đổi mã, giữ phân tích (swap)
+
+```text
+T1: Drawdown lớn nhất của NVDA năm 2024
+T2: còn TSLA thì sao
+```
+Kỳ vọng T2: drawdown lớn nhất của **TSLA năm 2024** (giữ "drawdown" + "2024").
+
+```text
+T1: Tính MA20 và MA50 của AAPL trong 100 ngày gần nhất
+T2: thế còn MSFT
+```
+Kỳ vọng T2: MA20 & MA50 của **MSFT** trong 100 ngày.
+
+### 14.3 Chuỗi 3+ lượt
+
+```text
+T1: Giá đóng cửa NVDA trong 30 ngày gần nhất
+T2: so với AAPL thì sao
+T3: còn TSLA thì sao
+```
+Kỳ vọng: T2 = NVDA + AAPL; T3 = TSLA (cùng chỉ số/khung thời gian).
+
+```text
+T1: Tính lợi suất của AAPL từ đầu năm 2024 đến cuối năm 2024
+T2: còn NVDA thì sao
+T3: so cả hai với SPY luôn
+```
+Kỳ vọng: T2 = lợi suất NVDA 2024; T3 = so AAPL, NVDA, SPY cùng kỳ.
+
+### 14.4 Đại từ / tham chiếu kết quả (khó hơn)
+
+```text
+T1: Top 5 phiên có volume cao nhất của NVDA
+T2: trong số đó phiên nào giá đóng cửa cao nhất?
+```
+Kỳ vọng T2: dựa trên tập kết quả T1, chọn phiên có close cao nhất.
+
+```text
+T1: Tìm các mã có giá đóng cửa mới nhất cao hơn MA20 và MA50
+T2: trong nhóm đó mã nào có volatility thấp nhất?
+```
+Kỳ vọng T2: lọc tiếp trên nhóm mã của T1 theo volatility.
+
+### 14.5 Đổi chỉ số nhưng giữ mã + khung thời gian
+
+```text
+T1: Giá đóng cửa của TSLA trong 90 ngày gần nhất
+T2: thế còn volume thì sao
+T3: 90 ngày đó TSLA có bao nhiêu phiên tăng giá?
+```
+Kỳ vọng: T2 = volume TSLA 90 ngày; T3 = đếm phiên tăng của TSLA trong 90 ngày.
