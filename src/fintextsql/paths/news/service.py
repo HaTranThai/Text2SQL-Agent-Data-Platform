@@ -21,7 +21,7 @@ RSS_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; FinTextSQL/0.1; +https://localhost)",
     "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
-NEWS_ANALYSIS_TIMEOUT_SECONDS = 20
+NEWS_ANALYSIS_TIMEOUT_SECONDS = 60
 NEWS_FETCH_TIMEOUT_SECONDS = 8
 
 
