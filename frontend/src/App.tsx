@@ -7,9 +7,12 @@ import {
   ChevronDown,
   Database,
   Loader2,
+  Moon,
+  Plus,
   RefreshCw,
   Send,
   Sparkles,
+  Sun,
   Table2,
   TerminalSquare,
   User,
@@ -124,7 +127,7 @@ const samplePrompts = [
 ];
 
 export default function App() {
-  const sessionId = useMemo(() => makeSessionId(), []);
+  const [sessionId, setSessionId] = useState(() => makeSessionId());
   const [messages, setMessages] = useState<ChatMessage[]>(starterMessages);
   const [input, setInput] = useState("");
   const [showSuggestions, setShowSuggestions] = useState(true);
@@ -135,13 +138,29 @@ export default function App() {
   const [period, setPeriod] = useState("1y");
   const [companies, setCompanies] = useState<Company[]>([]);
   const [health, setHealth] = useState<"checking" | "ok" | "down">("checking");
+  const [theme, setTheme] = useState<"light" | "dark">(() => readStoredTheme());
   const conversationRef = useRef<HTMLDivElement | null>(null);
 
   const loadedTickers = useMemo(() => new Set(companies.map((company) => company.ticker)), [companies]);
 
   useEffect(() => {
+    try {
+      window.localStorage.setItem("fintextsql.theme", theme);
+    } catch {
+      // ignore
+    }
+  }, [theme]);
+
+  useEffect(() => {
     void refreshMetadata();
   }, []);
+
+  function startNewChat() {
+    setMessages(starterMessages);
+    setInput("");
+    setActiveProgress(null);
+    setSessionId(freshSessionId());
+  }
 
   useEffect(() => {
     conversationRef.current?.scrollTo({
@@ -269,57 +288,87 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell">
-      <header className="topbar">
-        <div className="brand-row">
-          <Database size={22} aria-hidden="true" />
+    <div className="app-shell" data-theme={theme}>
+      <aside className="sidebar">
+        <div className="sidebar-brand">
+          <span className="brand-logo">
+            <Database size={18} aria-hidden="true" />
+          </span>
           <div>
             <h1>FinTextSQL</h1>
-            <p>Finance Text-to-SQL assistant</p>
+            <p>Phân tích tài chính</p>
           </div>
         </div>
-      </header>
 
-      <main className="chat-shell">
-        <form className="data-strip" onSubmit={runIngestion}>
-          <div className="data-strip-title">
-            <Database size={18} aria-hidden="true" />
-            <span>Data</span>
-          </div>
-          <input value={tickers} onChange={(event) => setTickers(event.target.value)} aria-label="Tickers" />
-          <select value={period} onChange={(event) => setPeriod(event.target.value)} aria-label="Period">
-            <option value="1mo">1mo</option>
-            <option value="3mo">3mo</option>
-            <option value="6mo">6mo</option>
-            <option value="1y">1y</option>
-            <option value="2y">2y</option>
-            <option value="5y">5y</option>
-          </select>
-          <button type="submit" disabled={ingesting || !tickers.trim()}>
-            {ingesting ? <Loader2 size={16} aria-hidden="true" /> : <RefreshCw size={16} aria-hidden="true" />}
-            Sync
-          </button>
-          <button className="icon-button" type="button" onClick={() => void refreshMetadata()} title="Refresh">
-            <RefreshCw size={17} aria-hidden="true" />
-          </button>
-        </form>
+        <button type="button" className="new-chat" onClick={startNewChat}>
+          <Plus size={16} aria-hidden="true" />
+          Cuộc trò chuyện mới
+        </button>
 
-        <div className="universe-row" aria-label="Loaded symbols">
-          {companies.length ? (
-            companies.slice(0, 12).map((company) => (
-              <span key={company.ticker}>
-                {company.ticker}
-                <small>{company.currency ?? company.sector ?? "loaded"}</small>
-              </span>
-            ))
-          ) : (
-            <span>
-              No symbols loaded
-              <small>sync first</small>
-            </span>
-          )}
+        <div className="sidebar-section">
+          <div className="sidebar-section-title">Dữ liệu</div>
+          <form className="data-panel" onSubmit={runIngestion}>
+            <input
+              value={tickers}
+              onChange={(event) => setTickers(event.target.value)}
+              aria-label="Tickers"
+              placeholder="AAPL, MSFT, NVDA"
+            />
+            <div className="data-panel-row">
+              <select value={period} onChange={(event) => setPeriod(event.target.value)} aria-label="Period">
+                <option value="1mo">1mo</option>
+                <option value="3mo">3mo</option>
+                <option value="6mo">6mo</option>
+                <option value="1y">1y</option>
+                <option value="2y">2y</option>
+                <option value="5y">5y</option>
+              </select>
+              <button type="submit" disabled={ingesting || !tickers.trim()}>
+                {ingesting ? <Loader2 size={15} aria-hidden="true" /> : <RefreshCw size={15} aria-hidden="true" />}
+                Sync
+              </button>
+            </div>
+          </form>
         </div>
 
+        <div className="sidebar-section sidebar-universe">
+          <div className="sidebar-section-title">
+            Mã đã nạp ({companies.length})
+            <button className="icon-button-sm" type="button" onClick={() => void refreshMetadata()} title="Làm mới">
+              <RefreshCw size={13} aria-hidden="true" />
+            </button>
+          </div>
+          <div className="universe-list" aria-label="Loaded symbols">
+            {companies.length ? (
+              companies.map((company) => (
+                <span key={company.ticker} title={company.name ?? company.ticker}>
+                  {company.ticker}
+                </span>
+              ))
+            ) : (
+              <span className="muted-chip">Chưa có mã — Sync trước</span>
+            )}
+          </div>
+        </div>
+
+        <div className="sidebar-footer">
+          <span className={`health-dot ${health}`} title={health === "ok" ? "Backend online" : health === "down" ? "Backend offline" : "Đang kiểm tra"} />
+          <span className="health-label">
+            {health === "ok" ? "Online" : health === "down" ? "Offline" : "Đang kiểm tra"}
+          </span>
+          <button
+            type="button"
+            className="theme-toggle"
+            onClick={() => setTheme((value) => (value === "dark" ? "light" : "dark"))}
+            title={theme === "dark" ? "Chuyển sáng" : "Chuyển tối"}
+          >
+            {theme === "dark" ? <Sun size={16} aria-hidden="true" /> : <Moon size={16} aria-hidden="true" />}
+            {theme === "dark" ? "Sáng" : "Tối"}
+          </button>
+        </div>
+      </aside>
+
+      <main className="chat-main">
         <section className="conversation" ref={conversationRef} aria-label="Conversation">
           {messages.map((message, index) => (
             <ChatBubble
@@ -1257,6 +1306,29 @@ function toFiniteNumber(value: unknown): number | null {
     return Number.isFinite(parsed) ? parsed : null;
   }
   return null;
+}
+
+function readStoredTheme(): "light" | "dark" {
+  try {
+    const stored = window.localStorage.getItem("fintextsql.theme");
+    if (stored === "light" || stored === "dark") return stored;
+  } catch {
+    // ignore
+  }
+  return "light";
+}
+
+function freshSessionId(): string {
+  const id =
+    "crypto" in window && "randomUUID" in window.crypto
+      ? window.crypto.randomUUID()
+      : `session-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    window.localStorage.setItem("fintextsql.sessionId", id);
+  } catch {
+    // ignore
+  }
+  return id;
 }
 
 function makeSessionId(): string {
