@@ -137,10 +137,6 @@ export default function App() {
   const [health, setHealth] = useState<"checking" | "ok" | "down">("checking");
   const conversationRef = useRef<HTMLDivElement | null>(null);
 
-  const latestResponse = useMemo(
-    () => [...messages].reverse().find((message) => message.response)?.response,
-    [messages],
-  );
   const loadedTickers = useMemo(() => new Set(companies.map((company) => company.ticker)), [companies]);
 
   useEffect(() => {
@@ -282,14 +278,6 @@ export default function App() {
             <p>Finance Text-to-SQL assistant</p>
           </div>
         </div>
-        <div className="topbar-actions">
-          <StatusPill icon={<Table2 size={16} />} label={`${latestResponse?.rows.length ?? 0} rows`} />
-          <StatusPill icon={<Database size={16} />} label={`${companies.length} symbols`} />
-          <div className={`status-pill ${health}`}>
-            <Activity size={16} aria-hidden="true" />
-            {health === "ok" ? "Backend online" : health === "down" ? "Backend offline" : "Checking"}
-          </div>
-        </div>
       </header>
 
       <main className="chat-shell">
@@ -388,15 +376,6 @@ export default function App() {
           </button>
         </form>
       </main>
-    </div>
-  );
-}
-
-function StatusPill({ icon, label }: { icon: JSX.Element; label: string }) {
-  return (
-    <div className="status-pill muted">
-      {icon}
-      {label}
     </div>
   );
 }

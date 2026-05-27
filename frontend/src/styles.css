@@ -846,3 +846,14 @@ button svg {
     min-width: 0;
   }
 }
+
+/* Hide scrollbars everywhere while keeping scroll behavior. */
+* {
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* legacy Edge/IE */
+}
+
+*::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
