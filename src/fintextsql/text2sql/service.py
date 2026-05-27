@@ -2045,14 +2045,30 @@ def _deterministic_latest_volume_explanation(question: str, rows: list[dict[str,
             grouped.setdefault(str(row["ticker"]), []).append(row)
     if not grouped:
         return None
-    lines = ["Đã lấy volume giao dịch cho các phiên gần nhất.", "", "### Volume theo phiên"]
+    lines = ["Đã lấy volume giao dịch theo phiên.", ""]
     for ticker, ticker_rows in sorted(grouped.items()):
         ordered = sorted(ticker_rows, key=lambda row: str(row.get("date", "")), reverse=True)
-        lines.append(f"- {ticker}:")
-        for row in ordered:
-            lines.append(f"  - {str(row['date'])[:10]}: {_format_integer(row['volume'])}")
-    lines.extend(["", "### Lưu ý", "- Đây là volume theo các phiên giao dịch mới nhất có trong Postgres."])
-    return "\n".join(lines)
+        count = len(ordered)
+        avg = sum(float(row["volume"]) for row in ordered) / count
+        highest = max(ordered, key=lambda row: float(row["volume"]))
+        lowest = min(ordered, key=lambda row: float(row["volume"]))
+        lines.append(f"### {ticker}")
+        lines.append(f"- {count} phiên, từ {str(ordered[-1]['date'])[:10]} đến {str(ordered[0]['date'])[:10]}.")
+        lines.append(f"- Trung bình: {_format_integer(int(round(avg)))}/phiên.")
+        lines.append(
+            f"- Cao nhất: {_format_integer(highest['volume'])} ({str(highest['date'])[:10]}); "
+            f"thấp nhất: {_format_integer(lowest['volume'])} ({str(lowest['date'])[:10]})."
+        )
+        if count <= 8:
+            for row in ordered:
+                lines.append(f"  - {str(row['date'])[:10]}: {_format_integer(row['volume'])}")
+        else:
+            lines.append("- Vài phiên gần nhất:")
+            for row in ordered[:5]:
+                lines.append(f"  - {str(row['date'])[:10]}: {_format_integer(row['volume'])}")
+        lines.append("")
+    lines.append("Chi tiết từng phiên xem bảng và biểu đồ bên dưới.")
+    return "\n".join(lines).strip()
 
 
 def _deterministic_top_volume_explanation(question: str, rows: list[dict[str, Any]]) -> str | None:
