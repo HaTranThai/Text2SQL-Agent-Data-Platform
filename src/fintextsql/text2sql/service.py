@@ -2838,7 +2838,7 @@ def _long_price_change_explanation(question: str, rows: list[dict[str, Any]]) ->
     chart_requested = any(word in question.lower() for word in ["chart", "biểu đồ", "bieu do", "vẽ", "ve", "plot"])
     lines = [
         (
-            f"Đã lấy dữ liệu giá đóng cửa cho {len(summaries)} mã trong {window_label}, "
+            f"Đã lấy {total_points} dòng giá đóng cửa cho {len(summaries)} mã trong {window_label}, "
             f"từ {start_date} đến {end_date}."
         ),
     ]

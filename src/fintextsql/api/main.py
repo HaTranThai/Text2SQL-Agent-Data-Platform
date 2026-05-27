@@ -42,6 +42,7 @@ SESSION_TICKERS: dict[str, list[str]] = {}
 SESSION_MESSAGES: dict[str, str] = {}
 SESSION_HISTORY: dict[str, list[dict[str, Any]]] = {}
 SESSION_STATE: dict[str, dict[str, Any]] = {}
+SESSION_RESULT: dict[str, dict[str, Any]] = {}
 MAX_SESSION_TURNS = 8
 app = FastAPI(title="FinTextSQL", version="0.1.0")
 app.add_middleware(
@@ -546,6 +547,7 @@ def _remember_session_turn(
 
     _remember_session_message(session_id, user_message)
     _remember_session_tickers(session_id, decision.tickers)
+    _remember_session_result(session_id, response)
     state = _extract_turn_state(user_message, response, decision)
     _remember_session_state(session_id, state)
 
@@ -975,21 +977,76 @@ def _replace_tickers_in_text(text: str, old_tickers: list[str], target_tickers: 
     return re.sub(r"\s+", " ", result).strip().strip(",").strip()
 
 
+def _extract_window_phrase(text: str) -> str:
+    """Pull a Vietnamese time-window phrase from a question ("90 ngày gần nhất", "năm 2024"...)."""
+    ascii_text = _strip_vietnamese_accents(text.lower())
+    match = re.search(r"quy ([1-4]) nam (\d{4})", ascii_text)
+    if match:
+        return f"quý {match.group(1)} năm {match.group(2)}"
+    match = re.search(r"thang (\d{1,2}) nam (\d{4})", ascii_text)
+    if match:
+        return f"tháng {match.group(1)} năm {match.group(2)}"
+    match = re.search(r"nam (\d{4})", ascii_text)
+    if match:
+        return f"năm {match.group(1)}"
+    match = re.search(r"(\d{1,4})\s*(ngay|thang|nam|phien)\s*gan nhat", ascii_text)
+    if match:
+        unit = {"ngay": "ngày", "thang": "tháng", "nam": "năm", "phien": "phiên"}[match.group(2)]
+        return f"{match.group(1)} {unit} gần nhất"
+    return ""
+
+
+def _remember_session_result(session_id: str | None, response: ChatResponse) -> None:
+    """Keep the tickers and dates of the latest result so follow-ups can reference them."""
+    if not session_id or not response.rows:
+        return
+    tickers: list[str] = []
+    dates: list[str] = []
+    for row in response.rows:
+        ticker = row.get("ticker")
+        if isinstance(ticker, str) and ticker not in tickers:
+            tickers.append(ticker)
+        date = row.get("date")
+        if date:
+            date_str = str(date)[:10]
+            if date_str not in dates:
+                dates.append(date_str)
+    SESSION_RESULT[session_id] = {"tickers": tickers[:20], "dates": dates[:40]}
+
+
+def _resolve_result_reference(session_id: str, message: str) -> str | None:
+    """Handle "trong số đó / trong nhóm đó" by constraining to the previous result set."""
+    text = _strip_vietnamese_accents(message.lower())
+    if not any(p in text for p in ["trong so do", "trong nhom do", "trong danh sach", "trong cac ma do", "trong nhung ma", "trong tap"]):
+        return None
+    result = SESSION_RESULT.get(session_id) or {}
+    tickers = result.get("tickers") or []
+    dates = result.get("dates") or []
+    if dates and any(word in text for word in ["phien", "ngay"]):
+        return f"{message} — chỉ xét trong các ngày sau của {', '.join(tickers) or 'mã đã hỏi'}: {', '.join(dates)}"
+    if len(tickers) >= 2 and any(word in text for word in ["ma", "co phieu", "ticker"]):
+        return f"{message} — chỉ xét trong các mã sau: {', '.join(tickers)}"
+    if tickers:
+        return f"{message} — chỉ xét trong: {', '.join(tickers)}"
+    return None
+
+
 def _rewrite_follow_up(session_id: str | None, message: str) -> str | None:
     """Resolve a context-borrowing follow-up by rewriting the previous question.
 
-    Handles comparison ("so nó với GOOG" -> merge tickers) and continuation
-    ("còn TSLA thì sao" -> swap ticker), reusing the prior analysis/metric/window.
-    Returns None when the message is self-sufficient or not a follow-up.
+    Three cases: swap/merge ticker keeping prior metric ("còn TSLA thì sao",
+    "so nó với GOOG"); swap metric keeping prior ticker+window ("thế còn volume
+    thì sao"); pronoun-only ("tương tự thì sao"). None when self-sufficient.
     """
     if not session_id:
         return None
+    result_ref = _resolve_result_reference(session_id, message)
+    if result_ref:
+        return result_ref
     prev = SESSION_MESSAGES.get(session_id)
     if not prev:
         return None
     text = _strip_vietnamese_accents(message.lower())
-    if _has_metric_term(text):
-        return None  # the message already names its own metric -> not borrowing context
     words = text.split()
     is_compare = ("so" in words or "so sanh" in text or "doi chieu" in text or "vs" in words) and (
         "voi" in words or "cung" in words or "vs" in words
@@ -1000,17 +1057,31 @@ def _rewrite_follow_up(session_id: str | None, message: str) -> str | None:
     is_pronoun = any(phrase in text for phrase in ["cai do", "cai nay", "cai kia", "chung", "cac ma do"]) or "no" in words
     if not (is_compare or is_continuation or is_pronoun):
         return None
+
     old_tickers = extract_tickers(prev)
     if not old_tickers:
         return None
     new_tickers = extract_tickers(message)
-    if new_tickers:
+    has_metric = _has_metric_term(text)
+
+    # Case A: new ticker(s), no own metric -> swap/merge ticker, reuse prior analysis.
+    if new_tickers and not has_metric:
         target = _merge_tickers(old_tickers, new_tickers) if is_compare else new_tickers
         rewritten = _replace_tickers_in_text(prev, old_tickers, target)
-        if rewritten:
-            return rewritten
-        return f"{prev} — áp dụng cho {', '.join(target)}"
-    return prev  # pronoun-only follow-up: reuse the previous question verbatim
+        return rewritten or f"{prev} — áp dụng cho {', '.join(target)}"
+
+    # Case B: own metric but no new ticker -> swap metric, keep prior tickers + window.
+    if has_metric and not new_tickers:
+        window = _extract_window_phrase(prev)
+        suffix = f" của {', '.join(old_tickers)}"
+        if window:
+            suffix += f" trong {window}"
+        return f"{message}{suffix}"
+
+    # Case C: pronoun-only (no metric, no new ticker) -> reuse the previous question.
+    if not has_metric and not new_tickers:
+        return prev
+    return None
 
 
 def _merge_tickers(previous: list[str], current: list[str]) -> list[str]:
