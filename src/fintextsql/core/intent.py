@@ -74,6 +74,16 @@ class IntentRouter:
         if _is_general_chat(text, tickers=tickers):
             return RouteDecision("general", "high", tickers, "General assistant/help question detected")
 
+        # Low-information input (no ticker and no analytical signal, e.g. "a", "asdf"):
+        # do not fabricate a SQL query — ask the user to be more specific.
+        if not tickers and not _contains(text, _ANALYTICAL_SIGNALS):
+            return RouteDecision(
+                "general",
+                "low",
+                tickers,
+                "No ticker or analytical signal detected; needs a clearer question",
+            )
+
         return RouteDecision("text_to_sql", "medium", tickers, "Default analytical path")
 
 
@@ -127,6 +137,23 @@ _ANALYTICAL_SIGNALS = [
     "tin tuc",
     "tin moi",
     "co tin",
+    "drawdown",
+    "volatility",
+    "bien dong",
+    "correlation",
+    "tuong quan",
+    "return",
+    "loi suat",
+    "rui ro",
+    "ohlc",
+    "ma20",
+    "ma50",
+    "ma200",
+    "von hoa",
+    "phien",
+    "co phieu",
+    "ticker",
+    "ma nao",
 ]
 
 

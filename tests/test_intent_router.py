@@ -60,3 +60,14 @@ def test_explicit_nvda_quarterly_close_question_stays_text_to_sql() -> None:
 
     assert decision.intent == "text_to_sql"
     assert decision.tickers == ["NVDA"]
+
+
+def test_low_information_input_routes_to_general() -> None:
+    for junk in ["a", "asdf", "ok", "hmm", "?? "]:
+        decision = IntentRouter().route(junk)
+        assert decision.intent == "general", f"{junk!r} should not become text_to_sql"
+
+
+def test_analytical_without_ticker_still_text_to_sql() -> None:
+    assert IntentRouter().route("top companies by market cap").intent == "text_to_sql"
+    assert IntentRouter().route("drawdown lớn nhất năm 2024").intent == "text_to_sql"
