@@ -35,6 +35,7 @@ type VisualizationSpec = {
   type: "line" | "bar" | "area" | "scatter";
   x?: string | null;
   y?: string | null;
+  y_series?: string[] | null;
   series?: string | null;
   title?: string | null;
 };
@@ -816,6 +817,7 @@ function ResultChart({
     yKey,
     visualization.series ?? null,
     visualization.type,
+    visualization.y_series ?? null,
   );
   if (!data.length || !seriesKeys.length) return null;
 
@@ -1011,9 +1013,13 @@ function buildChartData(
   yKey: string,
   seriesKey: string | null,
   chartType: VisualizationSpec["type"],
+  explicitSeries: string[] | null = null,
 ) {
-  if (!seriesKey) {
-    const yKeys = wideMetricColumns(response, xKey, yKey, chartType);
+  const numericExplicit = (explicitSeries ?? []).filter((key) => isNumericColumn(response.rows, key));
+  if (numericExplicit.length || !seriesKey) {
+    const yKeys = numericExplicit.length
+      ? numericExplicit
+      : wideMetricColumns(response, xKey, yKey, chartType);
     return {
       data: response.rows
         .map((row) => {

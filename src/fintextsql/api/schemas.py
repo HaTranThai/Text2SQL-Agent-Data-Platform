@@ -16,6 +16,7 @@ class VisualizationSpec(BaseModel):
     type: Literal["line", "bar", "area", "scatter"] = "line"
     x: str | None = None
     y: str | None = None
+    y_series: list[str] | None = None  # multiple metric columns to plot as separate lines
     series: str | None = None
     title: str | None = None
 

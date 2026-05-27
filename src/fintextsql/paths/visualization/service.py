@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from fintextsql.api.schemas import VisualizationSpec
@@ -54,6 +55,22 @@ def infer_visualization(
     if "ticker" in columns and (_is_cross_sectional_metric(y) or "top" in question_l):
         x = "ticker"
 
+    # Multi-metric time series for a single ticker (e.g. close + MA20 + MA50): plot every
+    # price-family column as its own line instead of collapsing to a single close line.
+    if x in {"date", "as_of_date"}:
+        distinct_tickers = {str(row.get("ticker")) for row in rows if row.get("ticker")}
+        family = _price_family_columns(columns, rows, exclude={x})
+        if len(distinct_tickers) <= 1 and len(family) >= 2:
+            chart_type = "bar" if any(word in question_l for word in ["bar", "cột"]) else "line"
+            return VisualizationSpec(
+                type=chart_type,
+                x=x,
+                y=family[0],
+                y_series=family,
+                series=None,
+                title="Finance visualization",
+            )
+
     series = "ticker" if "ticker" in columns and x != "ticker" else None
     chart_type = "line"
     if any(word in question_l for word in ["bar", "cột"]) or x == "ticker":
@@ -61,6 +78,22 @@ def infer_visualization(
     if "top" in question_l and x != "date":
         chart_type = "bar"
     return VisualizationSpec(type=chart_type, x=x, y=y, series=series, title="Finance visualization")
+
+
+_PRICE_FAMILY = {"close", "adj_close", "open", "high", "low"}
+
+
+def _price_family_columns(
+    columns: list[str], rows: list[dict[str, Any]], *, exclude: set[str]
+) -> list[str]:
+    family: list[str] = []
+    for column in columns:
+        if column in exclude:
+            continue
+        lowered = column.lower()
+        if (lowered in _PRICE_FAMILY or re.fullmatch(r"ma\d+", lowered)) and _column_has_number(rows, column):
+            family.append(column)
+    return family
 
 
 def _preferred_y_columns(question_l: str) -> list[str]:
