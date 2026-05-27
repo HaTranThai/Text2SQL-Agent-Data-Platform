@@ -993,6 +993,11 @@ def _extract_window_phrase(text: str) -> str:
     if match:
         unit = {"ngay": "ngày", "thang": "tháng", "nam": "năm", "phien": "phiên"}[match.group(2)]
         return f"{match.group(1)} {unit} gần nhất"
+    # Loose fallback: a bare "N ngày/tháng/năm/phiên" -> treat as a recent window.
+    match = re.search(r"(\d{1,4})\s*(ngay|thang|nam|phien)\b", ascii_text)
+    if match:
+        unit = {"ngay": "ngày", "thang": "tháng", "nam": "năm", "phien": "phiên"}[match.group(2)]
+        return f"{match.group(1)} {unit} gần nhất"
     return ""
 
 
@@ -1031,6 +1036,14 @@ def _resolve_result_reference(session_id: str, message: str) -> str | None:
     return None
 
 
+def _swap_window_phrase(text: str, new_window: str) -> str:
+    """Replace the time-window phrase in `text` with `new_window` (append if none found)."""
+    old_window = _extract_window_phrase(text)
+    if old_window and old_window.lower() in text.lower():
+        return re.sub(re.escape(old_window), new_window, text, count=1, flags=re.IGNORECASE)
+    return f"{text} trong {new_window}"
+
+
 def _rewrite_follow_up(session_id: str | None, message: str) -> str | None:
     """Resolve a context-borrowing follow-up by rewriting the previous question.
 
@@ -1048,35 +1061,48 @@ def _rewrite_follow_up(session_id: str | None, message: str) -> str | None:
         return None
     text = _strip_vietnamese_accents(message.lower())
     words = text.split()
-    is_compare = ("so" in words or "so sanh" in text or "doi chieu" in text or "vs" in words) and (
-        "voi" in words or "cung" in words or "vs" in words
+    is_additive = any(phrase in text for phrase in ["them ", "them ca", " nua", "cung voi", "cung "])
+    is_compare = is_additive or (
+        ("so" in words or "so sanh" in text or "doi chieu" in text or "vs" in words)
+        and ("voi" in words or "cung" in words or "vs" in words)
     )
     is_continuation = any(
-        phrase in text for phrase in ["con ", "the con", "thi sao", "tuong tu", "con lai", "tiep theo"]
+        phrase in text
+        for phrase in ["con ", "the con", "thi sao", "tuong tu", "con lai", "tiep theo", "doi sang", "chuyen sang"]
     )
     is_pronoun = any(phrase in text for phrase in ["cai do", "cai nay", "cai kia", "chung", "cac ma do"]) or "no" in words
-    if not (is_compare or is_continuation or is_pronoun):
-        return None
+    new_window = _extract_window_phrase(message)
 
     old_tickers = extract_tickers(prev)
     if not old_tickers:
         return None
     new_tickers = extract_tickers(message)
     has_metric = _has_metric_term(text)
+    is_window_swap = bool(new_window) and not new_tickers and not has_metric
+
+    if not (is_compare or is_continuation or is_pronoun or is_window_swap):
+        return None
 
     # Case A: new ticker(s), no own metric -> swap/merge ticker, reuse prior analysis.
     if new_tickers and not has_metric:
         target = _merge_tickers(old_tickers, new_tickers) if is_compare else new_tickers
         rewritten = _replace_tickers_in_text(prev, old_tickers, target)
-        return rewritten or f"{prev} — áp dụng cho {', '.join(target)}"
+        result = rewritten or f"{prev} — áp dụng cho {', '.join(target)}"
+        if new_window:  # follow-up also changed the window, e.g. "còn GOOG trong 7 ngày"
+            result = _swap_window_phrase(result, new_window)
+        return result
 
     # Case B: own metric but no new ticker -> swap metric, keep prior tickers + window.
     if has_metric and not new_tickers:
-        window = _extract_window_phrase(prev)
+        window = new_window or _extract_window_phrase(prev)
         suffix = f" của {', '.join(old_tickers)}"
         if window:
             suffix += f" trong {window}"
         return f"{message}{suffix}"
+
+    # Case D: new time window only -> keep prior tickers + metric, swap the window.
+    if is_window_swap:
+        return _swap_window_phrase(prev, new_window)
 
     # Case C: pronoun-only (no metric, no new ticker) -> reuse the previous question.
     if not has_metric and not new_tickers:

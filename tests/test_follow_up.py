@@ -53,6 +53,30 @@ def test_result_reference_constrains_to_previous_dates() -> None:
     assert "2024-09-20" in out and "NVDA" in out
 
 
+def test_additive_follow_up_merges_tickers() -> None:
+    _seed("a1", "Giá đóng cửa của AAPL trong 30 ngày gần nhất")
+    out = M._rewrite_follow_up("a1", "thêm MSFT nữa")
+    assert out is not None and "AAPL" in out and "MSFT" in out and "30 ngày" in out
+
+
+def test_explicit_swap_follow_up() -> None:
+    _seed("a2", "Giá đóng cửa của AAPL trong 30 ngày gần nhất")
+    out = M._rewrite_follow_up("a2", "đổi sang NVDA")
+    assert out is not None and "NVDA" in out and "AAPL" not in out
+
+
+def test_window_swap_keeps_ticker_and_metric() -> None:
+    _seed("a3", "Giá đóng cửa của AAPL trong 30 ngày gần nhất")
+    out = M._rewrite_follow_up("a3", "tính cho 60 ngày")
+    assert out is not None and "AAPL" in out and "60 ngày" in out and "30 ngày" not in out
+
+
+def test_period_swap_changes_year() -> None:
+    _seed("a4", "Drawdown lớn nhất của NVDA năm 2024")
+    out = M._rewrite_follow_up("a4", "năm 2023 thì sao")
+    assert out is not None and "2023" in out and "2024" not in out and "Drawdown" in out
+
+
 def test_result_reference_constrains_to_previous_tickers() -> None:
     _seed("c7", "Tìm các mã có giá đóng cửa mới nhất cao hơn MA20 và MA50")
     M.SESSION_RESULT["c7"] = {"tickers": ["AAPL", "MSFT", "NVDA"], "dates": []}
