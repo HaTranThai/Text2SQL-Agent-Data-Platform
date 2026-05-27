@@ -366,7 +366,7 @@ export default function App() {
               event.preventDefault();
               event.currentTarget.form?.requestSubmit();
             }}
-            placeholder="Hỏi bằng tiếng Việt hoặc tiếng Anh — vd: So sánh giá AAPL và MSFT 30 ngày, hoặc hỏi tiếp “còn NVDA thì sao”…"
+            placeholder="Hỏi bất cứ điều gì..."
             aria-label="Ô nhập câu hỏi"
           />
           <button type="submit" disabled={loading || !input.trim()} title="Gửi (Enter)">
