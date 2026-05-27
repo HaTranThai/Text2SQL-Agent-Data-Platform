@@ -111,15 +111,21 @@ const starterMessages: ChatMessage[] = [
 
 const samplePrompts = [
   "So sánh close price của AAPL và MSFT trong 30 ngày gần nhất",
+  "Tính MA20 và MA50 của AAPL trong 100 ngày gần nhất",
+  "Drawdown lớn nhất của NVDA năm 2024",
+  "Tính beta của NVDA so với SPY trong 2 năm gần nhất",
+  "Tương quan lợi suất ngày giữa AAPL và MSFT trong 1 năm gần nhất",
+  "Top 5 phiên có volume cao nhất của TSLA",
   "Top companies by market cap",
   "Giá hiện tại của AAPL MSFT NVDA",
-  "Tin mới về NVDA",
+  "% tăng/giảm 30 ngày của AAPL và MSFT",
+  "Tin mới có thể ảnh hưởng tới giá NVDA",
 ];
 
 export default function App() {
   const sessionId = useMemo(() => makeSessionId(), []);
   const [messages, setMessages] = useState<ChatMessage[]>(starterMessages);
-  const [input, setInput] = useState("So sánh close price của AAPL và MSFT trong 30 ngày gần nhất");
+  const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [activeProgress, setActiveProgress] = useState<{ steps: ProgressStep[]; current: number } | null>(null);
   const [ingesting, setIngesting] = useState(false);
@@ -337,13 +343,18 @@ export default function App() {
           {loading ? <LoadingBubble progress={activeProgress} /> : null}
         </section>
 
-        <div className="suggestion-row">
-          {samplePrompts.map((prompt) => (
-            <button type="button" key={prompt} onClick={() => setInput(prompt)}>
-              <Sparkles size={14} aria-hidden="true" />
-              {prompt}
-            </button>
-          ))}
+        <div className="suggestions">
+          <div className="suggestions-label">
+            <Sparkles size={13} aria-hidden="true" />
+            Gợi ý câu hỏi
+          </div>
+          <div className="suggestion-row">
+            {samplePrompts.map((prompt) => (
+              <button type="button" key={prompt} onClick={() => setInput(prompt)} title={prompt}>
+                {prompt}
+              </button>
+            ))}
+          </div>
         </div>
 
         <form className="composer" onSubmit={sendMessage}>
@@ -355,9 +366,10 @@ export default function App() {
               event.preventDefault();
               event.currentTarget.form?.requestSubmit();
             }}
-            placeholder="Hỏi về giá, fundamentals, tin tức, market cap..."
+            placeholder="Hỏi bằng tiếng Việt hoặc tiếng Anh — vd: So sánh giá AAPL và MSFT 30 ngày, hoặc hỏi tiếp “còn NVDA thì sao”…"
+            aria-label="Ô nhập câu hỏi"
           />
-          <button type="submit" disabled={loading || !input.trim()} title="Send">
+          <button type="submit" disabled={loading || !input.trim()} title="Gửi (Enter)">
             {loading ? <Loader2 size={18} aria-hidden="true" /> : <Send size={18} aria-hidden="true" />}
           </button>
         </form>

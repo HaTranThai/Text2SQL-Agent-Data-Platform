@@ -656,59 +656,119 @@ button svg {
   flex: 0 0 auto;
 }
 
-.suggestion-row {
+.suggestions {
+  display: flex;
+  flex-direction: column;
   gap: 8px;
-  overflow-x: auto;
-  padding: 0 24px 10px;
+  padding: 6px 24px 12px;
+}
+
+.suggestions-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #98a2b3;
+}
+
+.suggestions-label svg {
+  color: #b76e2b;
+}
+
+.suggestion-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  overflow: visible;
+  padding: 0;
 }
 
 .suggestion-row button {
-  background: #ffffff;
-  border: 1px solid #dce2e8;
+  background: linear-gradient(180deg, #ffffff, #f5f8fa);
+  border: 1px solid #e2e7ee;
   border-radius: 999px;
-  color: #344054;
+  color: #3a4658;
   flex: 0 0 auto;
   font-size: 12px;
-  font-weight: 700;
-  gap: 6px;
+  font-weight: 600;
   min-height: 32px;
-  padding: 0 11px;
+  padding: 0 14px;
+  cursor: pointer;
+  transition: transform 0.12s ease, box-shadow 0.14s ease, border-color 0.14s ease, color 0.14s ease;
 }
 
-.suggestion-row button svg {
-  color: #b76e2b;
+.suggestion-row button:hover {
+  border-color: #2f7f6f;
+  color: #1f5f53;
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(47, 127, 111, 0.16);
+}
+
+.suggestion-row button:active {
+  transform: translateY(0);
 }
 
 .composer {
   background: #ffffff;
   border: 1px solid #dce2e8;
-  border-radius: 18px;
-  box-shadow: 0 14px 30px rgba(31, 41, 51, 0.09);
+  border-radius: 20px;
+  box-shadow: 0 16px 34px rgba(31, 41, 51, 0.1);
   gap: 10px;
-  margin: 0 24px 16px;
-  padding: 10px;
+  margin: 0 24px 18px;
+  padding: 10px 10px 10px 14px;
+  align-items: flex-end;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.composer:focus-within {
+  border-color: #2f7f6f;
+  box-shadow: 0 0 0 3px rgba(47, 127, 111, 0.14), 0 16px 34px rgba(31, 41, 51, 0.12);
 }
 
 .composer textarea {
   border: 0;
   flex: 1;
-  max-height: 170px;
-  min-height: 48px;
-  padding: 12px;
-  resize: vertical;
+  max-height: 200px;
+  min-height: 52px;
+  padding: 12px 6px;
+  resize: none;
+  font-size: 14px;
+  line-height: 1.5;
+  background: transparent;
+}
+
+.composer textarea::placeholder {
+  color: #9aa4b2;
 }
 
 .composer textarea:focus {
   box-shadow: none;
+  outline: none;
 }
 
 .composer button {
-  background: #2f7f6f;
+  background: linear-gradient(135deg, #2f7f6f, #2a6f8f);
   border-radius: 999px;
   color: #ffffff;
-  height: 42px;
+  height: 44px;
   justify-content: center;
-  width: 42px;
+  width: 44px;
+  flex: 0 0 auto;
+  box-shadow: 0 6px 16px rgba(47, 127, 111, 0.3);
+  transition: transform 0.12s ease, box-shadow 0.14s ease, opacity 0.14s ease;
+}
+
+.composer button:hover:not(:disabled) {
+  transform: translateY(-1px) scale(1.03);
+  box-shadow: 0 10px 22px rgba(47, 127, 111, 0.36);
+}
+
+.composer button:disabled {
+  opacity: 0.45;
+  box-shadow: none;
 }
 
 @keyframes spin {
