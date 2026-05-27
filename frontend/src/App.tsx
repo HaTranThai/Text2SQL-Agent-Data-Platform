@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   BarChart3,
   Bot,
+  ChevronDown,
   Database,
   Loader2,
   RefreshCw,
@@ -126,6 +127,7 @@ export default function App() {
   const sessionId = useMemo(() => makeSessionId(), []);
   const [messages, setMessages] = useState<ChatMessage[]>(starterMessages);
   const [input, setInput] = useState("");
+  const [showSuggestions, setShowSuggestions] = useState(true);
   const [loading, setLoading] = useState(false);
   const [activeProgress, setActiveProgress] = useState<{ steps: ProgressStep[]; current: number } | null>(null);
   const [ingesting, setIngesting] = useState(false);
@@ -344,17 +346,29 @@ export default function App() {
         </section>
 
         <div className="suggestions">
-          <div className="suggestions-label">
+          <button
+            type="button"
+            className="suggestions-label"
+            onClick={() => setShowSuggestions((value) => !value)}
+            aria-expanded={showSuggestions}
+          >
             <Sparkles size={13} aria-hidden="true" />
             Gợi ý câu hỏi
-          </div>
-          <div className="suggestion-row">
-            {samplePrompts.map((prompt) => (
-              <button type="button" key={prompt} onClick={() => setInput(prompt)} title={prompt}>
-                {prompt}
-              </button>
-            ))}
-          </div>
+            <ChevronDown
+              size={15}
+              className={`suggestions-chevron${showSuggestions ? " open" : ""}`}
+              aria-hidden="true"
+            />
+          </button>
+          {showSuggestions ? (
+            <div className="suggestion-row">
+              {samplePrompts.map((prompt) => (
+                <button type="button" key={prompt} onClick={() => setInput(prompt)} title={prompt}>
+                  {prompt}
+                </button>
+              ))}
+            </div>
+          ) : null}
         </div>
 
         <form className="composer" onSubmit={sendMessage}>

@@ -672,10 +672,29 @@ button svg {
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: #98a2b3;
+  background: transparent;
+  border: 0;
+  padding: 2px 0;
+  cursor: pointer;
+  align-self: flex-start;
+  transition: color 0.14s ease;
 }
 
-.suggestions-label svg {
+.suggestions-label:hover {
+  color: #2f7f6f;
+}
+
+.suggestions-label > svg:first-child {
   color: #b76e2b;
+}
+
+.suggestions-chevron {
+  color: #98a2b3;
+  transition: transform 0.18s ease;
+}
+
+.suggestions-chevron.open {
+  transform: rotate(180deg);
 }
 
 .suggestion-row {
