@@ -25,8 +25,17 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { format as formatSqlRaw } from "sql-formatter";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+
+function formatSql(sql: string): string {
+  try {
+    return formatSqlRaw(sql, { language: "postgresql", keywordCase: "preserve", tabWidth: 2 });
+  } catch {
+    return sql;
+  }
+}
 const TRACE_STEP_DELAY_MS = 1700;
 
 type IntentName = "general" | "text_to_sql" | "visualization" | "news" | "ingestion" | "simple_finance";
@@ -423,7 +432,7 @@ function ChatBubble({
               <TerminalSquare size={14} aria-hidden="true" />
               SQL
             </summary>
-            <pre className="sql-block">{response.sql}</pre>
+            <pre className="sql-block">{formatSql(response.sql)}</pre>
           </details>
         ) : null}
       </div>
@@ -457,7 +466,7 @@ function SubResults({ results }: { results: TaskResult[] }) {
                   <TerminalSquare size={14} aria-hidden="true" />
                   SQL
                 </summary>
-                <pre className="sql-block">{result.sql}</pre>
+                <pre className="sql-block">{result.sql ? formatSql(result.sql) : ""}</pre>
               </details>
             ) : null}
           </section>
