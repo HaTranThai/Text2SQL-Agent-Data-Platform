@@ -16,6 +16,12 @@ from sqlalchemy.orm import Session
 from fintextsql.core.config import Settings
 from fintextsql.core.tickers import extract_tickers
 from fintextsql.llm.client import LLMClient, LLMError, LLMMessage
+from fintextsql.text2sql.few_shot import (
+    FewShotExample,
+    find_similar,
+    record_example,
+    render_few_shot_block,
+)
 from fintextsql.text2sql.knowledge import Knowledge, extract_knowledge
 from fintextsql.text2sql.schema import SelectedSchema, generation_schema_text, select_schema
 from fintextsql.text2sql.sql_guard import (
@@ -64,7 +70,7 @@ class TextToSQLService:
     async def answer(self, question: str) -> TextToSQLResult:
         graph = self._build_graph()
         final = await graph.ainvoke({"question": question, "attempt": 0, "pipeline": []})
-        return TextToSQLResult(
+        result = TextToSQLResult(
             answer=final.get("answer", ""),
             sql=final.get("sql", ""),
             rows=final.get("rows", []),
@@ -76,6 +82,20 @@ class TextToSQLService:
                 "repair_error": final.get("last_error"),
             },
         )
+        # Remember successful runs so the few-shot retriever can teach the LLM
+        # on future similar questions. We skip fail/empty runs to avoid teaching
+        # bad templates back into the prompt.
+        if result.sql and result.rows and not final.get("last_error"):
+            try:
+                record_example(
+                    self.db,
+                    question=question,
+                    sql=result.sql,
+                    intent="text_to_sql",
+                )
+            except Exception:
+                self.db.rollback()
+        return result
 
     def _build_graph(self):
         service = self
@@ -269,6 +289,17 @@ class TextToSQLService:
         knowledge_block = (
             f"\n\nExtracted knowledge:\n{knowledge.as_prompt()}" if knowledge and knowledge.as_prompt() else ""
         )
+        few_shot_block = ""
+        try:
+            similar = find_similar(self.db, question)
+        except Exception:
+            self.db.rollback()
+            similar = []
+        if similar:
+            few_shot_block = (
+                "\n\nPast question/SQL pairs that worked here (use them as guidance when relevant; "
+                "adapt tickers/years to the current question):\n" + render_few_shot_block(similar)
+            )
         try:
             raw = await self.llm.chat(
                 [
@@ -298,6 +329,7 @@ class TextToSQLService:
                         f"Question:\n{question}\n\nSchema:\n{generation_schema_text()}"
                         f"\n\nMost relevant tables for this question: {', '.join(selected_schema.tables)}"
                         f"{knowledge_block}"
+                        f"{few_shot_block}"
                         f"\n\nPlan:\n{plan}",
                     ),
                 ],

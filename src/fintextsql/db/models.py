@@ -101,6 +101,28 @@ class NewsArticle(Base):
     )
 
 
+class QAExample(Base):
+    """Successful Q -> SQL pairs used as few-shot examples for the LLM SQL generator.
+
+    Stored cross-session so the assistant gets better at the user's recurring patterns
+    over time. ``embedding`` is a normalized feature-hash vector (see few_shot.py),
+    persisted as a JSON list of floats so we do not require pgvector.
+    """
+
+    __tablename__ = "qa_examples"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    question_key: Mapped[str] = mapped_column(String(500), unique=True, nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    sql: Mapped[str] = mapped_column(Text, nullable=False)
+    intent: Mapped[str | None] = mapped_column(String(40))
+    embedding: Mapped[list[float] | None] = mapped_column(JSONB)
+    use_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class IngestionRun(Base):
     __tablename__ = "ingestion_runs"
 
