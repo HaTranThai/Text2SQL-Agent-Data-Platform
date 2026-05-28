@@ -102,21 +102,17 @@ class TextToSQLService:
         max_rows = self.settings.max_sql_rows
 
         async def build_sql(state: T2SState) -> dict[str, Any]:
+            # Pipeline phases (matches architecture diagram in docs/Text2sql_report):
+            #   load_schema → schema_cache (lru_cache hit) → knowledge_extractor
+            #   → schema_selector → planner → sql_generator → candidate_generator_x3
+            # Candidate selector + execute happen in the `execute` node.
             question = state["question"]
-            knowledge = extract_knowledge(question)
-            selected_schema = select_schema(question)
-            deterministic_sql = _deterministic_sql(question, max_rows)
-            if deterministic_sql:
-                return {
-                    "knowledge": knowledge.as_prompt(),
-                    "selected_tables": selected_schema.tables,
-                    "plan": "Use deterministic SQL for the clearly recognized finance metric.",
-                    "sql": deterministic_sql,
-                    "candidates": [deterministic_sql],
-                    "pipeline": ["load_schema", "knowledge_extractor", "schema_selector", "deterministic_sql"],
-                }
-            plan = await service._plan(question, selected_schema, knowledge)
-            candidates = await service._generate_candidates(question, selected_schema, plan, knowledge)
+            knowledge = extract_knowledge(question)                # Knowledge Extractor
+            selected_schema = select_schema(question)              # Schema Cache + Schema Selector
+            plan = await service._plan(question, selected_schema, knowledge)  # Planner
+            candidates = await service._generate_candidates(       # SQL Generator → 3 candidates
+                question, selected_schema, plan, knowledge
+            )
             return {
                 "knowledge": knowledge.as_prompt(),
                 "selected_tables": selected_schema.tables,
@@ -125,11 +121,12 @@ class TextToSQLService:
                 "candidates": candidates,
                 "pipeline": [
                     "load_schema",
+                    "schema_cache",
                     "knowledge_extractor",
                     "schema_selector",
                     "planner",
-                    "candidate_generator",
-                    "sql_guard",
+                    "sql_generator",
+                    "candidate_generator_x3",
                 ],
             }
 
@@ -157,8 +154,10 @@ class TextToSQLService:
                 message = last_error or "SQL execution returned no usable candidate"
                 return {"error": message, "last_error": message}
             _score, rows, columns, sql = best
+            # `candidate_selector` always runs (even with 1 candidate it picks "the one");
+            # this keeps the pipeline trace consistent with the architecture diagram.
             pipeline: list[str] = []
-            if multi and "candidate_selector" not in state.get("pipeline", []):
+            if "candidate_selector" not in state.get("pipeline", []):
                 pipeline.append("candidate_selector")
             if "execute_sql" not in state.get("pipeline", []):
                 pipeline.append("execute_sql")
@@ -186,7 +185,7 @@ class TextToSQLService:
                 "candidates": [sql],
                 "attempt": state.get("attempt", 0) + 1,
                 "error": None,
-                "pipeline": ["repair_sql_error"],
+                "pipeline": ["repair_agent_error"],
             }
 
         async def repair_empty(state: T2SState) -> dict[str, Any]:
@@ -201,7 +200,7 @@ class TextToSQLService:
                 "sql": sql,
                 "candidates": [sql],
                 "attempt": state.get("attempt", 0) + 1,
-                "pipeline": ["repair_empty_result"],
+                "pipeline": ["repair_agent_empty"],
             }
 
         def fail(state: T2SState) -> dict[str, Any]:
@@ -612,56 +611,29 @@ class TextToSQLService:
         return rows
 
     def _fallback_sql(self, question: str) -> str:
-        tickers = extract_tickers(question)
-        question_l = question.lower()
-        deterministic_sql = _deterministic_sql(question, self.settings.max_sql_rows)
-        if deterministic_sql:
-            return deterministic_sql
-        price_change_sql = _price_change_sql(question, self.settings.max_sql_rows)
-        if price_change_sql:
-            return price_change_sql
-        quarterly_sql = _quarterly_close_comparison_sql(question, self.settings.max_sql_rows)
-        if quarterly_sql:
-            return quarterly_sql
-        monthly_high_sql = _monthly_high_close_sql(question, self.settings.max_sql_rows)
-        if monthly_high_sql:
-            return monthly_high_sql
-        high_close_sql = _high_close_sql(question, self.settings.max_sql_rows)
-        if high_close_sql:
-            return high_close_sql
+        """Minimal LLM-free fallback used only when the LLM call fails entirely.
 
-        if any(word in question_l for word in ["news", "tin tức", "headline"]):
-            where = _ticker_filter(tickers, column="ticker")
-            return (
-                "SELECT ticker, title, publisher, published_at, link "
-                f"FROM news_articles {where} ORDER BY published_at DESC NULLS LAST LIMIT 20"
-            )
-        if any(word in question_l for word in ["pe", "p/e", "market cap", "beta", "fundamental"]):
-            where = _ticker_filter(tickers, column="c.ticker")
-            return (
-                "SELECT c.ticker, c.name, f.as_of_date, f.market_cap, f.trailing_pe, f.forward_pe, "
-                "f.price_to_book, f.beta "
-                "FROM companies c JOIN fundamentals f ON f.company_id = c.id "
-                f"{where}ORDER BY f.market_cap DESC NULLS LAST, f.as_of_date DESC LIMIT 50"
-            )
+        Architecture intentionally does NOT use the deterministic SQL builders
+        (per the design in docs/Text2sql_report.docx — Chapter 3): when LLM is
+        unavailable we return a generic price-series query for any extracted
+        ticker over a reasonable date window. Caller will still surface this
+        through SQL Guard, so it's always read-only.
+        """
+        tickers = extract_tickers(question)
         ticker_cond = _ticker_condition(tickers, "c.ticker")
         year = _requested_year(question)
         if year:
-            # Explicit calendar year ("năm 2022", "in 2024", ...) takes precedence.
             date_cond: str | None = f"p.date >= DATE '{year}-01-01' AND p.date < DATE '{year + 1}-01-01'"
         else:
-            date_cond = _date_condition(question)
-        if not date_cond:
-            # Default to the most recent ~year so a vague "data of X" returns recent rows,
-            # not the oldest data in the database.
-            default_days = _requested_window_days(question) or 365
-            date_cond = f"p.date >= CURRENT_DATE - INTERVAL '{default_days} days'"
-        filters = [condition for condition in [ticker_cond, date_cond] if condition]
+            window_days = _requested_window_days(question) or 365
+            date_cond = f"p.date >= CURRENT_DATE - INTERVAL '{window_days} days'"
+        filters = [c for c in [ticker_cond, date_cond] if c]
         where = f"WHERE {' AND '.join(filters)} " if filters else ""
+        limit = _time_series_limit(question, tickers, self.settings.max_sql_rows)
         return (
             "SELECT c.ticker, c.name, p.date, p.close, p.volume "
             "FROM companies c JOIN prices p ON p.company_id = c.id "
-            f"{where}ORDER BY p.date ASC, c.ticker ASC LIMIT {_time_series_limit(question, tickers, self.settings.max_sql_rows)}"
+            f"{where}ORDER BY p.date ASC, c.ticker ASC LIMIT {limit}"
         )
 
 
