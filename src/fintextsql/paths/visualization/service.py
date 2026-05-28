@@ -64,6 +64,22 @@ def infer_visualization(
     if not rows or not columns:
         return None
     question_l = question.lower()
+
+    # Scatter: volume vs daily_return_pct paired observations.
+    if (
+        _wants_scatter(question_l)
+        and "volume" in columns
+        and "daily_return_pct" in columns
+    ):
+        series = "ticker" if "ticker" in columns else None
+        return VisualizationSpec(
+            type="scatter",
+            x="volume",
+            y="daily_return_pct",
+            series=series,
+            title="Volume vs daily return",
+        )
+
     y = _first_existing(columns, _preferred_y_columns(question_l))
     if y and not _column_has_number(rows, y):
         y = None
@@ -113,6 +129,10 @@ def infer_visualization(
 
 
 _PRICE_FAMILY = {"close", "adj_close", "open", "high", "low"}
+
+
+def _wants_scatter(question_l: str) -> bool:
+    return any(t in question_l for t in ["scatter", "scatterplot", "phân tán", "phan tan", "điểm phân tán"])
 
 
 def _price_family_columns(

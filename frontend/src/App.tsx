@@ -28,9 +28,12 @@ import {
   CartesianGrid,
   Legend,
   ResponsiveContainer,
+  Scatter,
+  ScatterChart,
   Tooltip,
   XAxis,
   YAxis,
+  ZAxis,
 } from "recharts";
 import { format as formatSqlRaw } from "sql-formatter";
 
@@ -980,8 +983,69 @@ function ResultChart({
   );
   if (!data.length || !seriesKeys.length) return null;
 
-  const Chart = visualization.type === "bar" ? BarChart : AreaChart;
   const isMoneyChart = seriesKeys.some(isMoneyMetric);
+
+  if (visualization.type === "scatter") {
+    return (
+      <div className="chart-box">
+        <ResponsiveContainer width="100%" height={330}>
+          <ScatterChart margin={{ top: 8, right: 28, bottom: 16, left: 8 }}>
+            <CartesianGrid strokeDasharray="4 4" stroke="#dfe6ee" />
+            <XAxis
+              type="number"
+              dataKey={xKey}
+              name={labelize(xKey)}
+              tick={{ fontSize: 12, fill: "#334155" }}
+              axisLine={{ stroke: "#334155" }}
+              tickLine={false}
+              tickFormatter={(value) => formatAxisValue(value, { currency: false })}
+            />
+            <YAxis
+              type="number"
+              dataKey={yKey}
+              name={labelize(yKey)}
+              tick={{ fontSize: 12, fill: "#334155" }}
+              axisLine={{ stroke: "#334155" }}
+              tickLine={false}
+              tickFormatter={(value) => formatAxisValue(value, { currency: false })}
+              width={64}
+            />
+            <ZAxis range={[40, 40]} />
+            <Tooltip
+              cursor={{ strokeDasharray: "4 4" }}
+              formatter={(value, name) => [
+                formatTooltipValue(value, { currency: false }),
+                labelize(String(name)),
+              ]}
+              contentStyle={{
+                borderRadius: 8,
+                borderColor: "#dce2e8",
+                boxShadow: "0 10px 30px rgba(15, 23, 42, 0.12)",
+                fontSize: 12,
+              }}
+            />
+            <Legend iconType="circle" wrapperStyle={{ fontSize: 12, paddingTop: 8 }} />
+            {seriesKeys.map((key, index) => {
+              const points = data.filter((row) => row[key] != null && row[xKey] != null).map((row) => ({
+                [xKey]: row[xKey],
+                [yKey]: row[key],
+              }));
+              return (
+                <Scatter
+                  key={key}
+                  name={labelize(key)}
+                  data={points}
+                  fill={chartColors[index % chartColors.length]}
+                />
+              );
+            })}
+          </ScatterChart>
+        </ResponsiveContainer>
+      </div>
+    );
+  }
+
+  const Chart = visualization.type === "bar" ? BarChart : AreaChart;
   const yDomain = visualization.type === "bar" ? undefined : priceAwareDomain(data, seriesKeys, isMoneyChart);
   return (
     <div className="chart-box">
@@ -1174,6 +1238,31 @@ function buildChartData(
   chartType: VisualizationSpec["type"],
   explicitSeries: string[] | null = null,
 ) {
+  // Scatter: keep every row as its own point. If `seriesKey` is set, fan out one
+  // column per series value so each can be rendered as a separate Scatter layer.
+  if (chartType === "scatter") {
+    if (!seriesKey) {
+      const data = response.rows
+        .map((row) => ({
+          [xKey]: toFiniteNumber(row[xKey]),
+          [yKey]: toFiniteNumber(row[yKey]),
+        }))
+        .filter((row) => row[xKey] !== null && row[yKey] !== null);
+      return { data, seriesKeys: [yKey] };
+    }
+    const series = new Set<string>();
+    const data: Record<string, unknown>[] = [];
+    for (const row of response.rows) {
+      const xValue = toFiniteNumber(row[xKey]);
+      const yValue = toFiniteNumber(row[yKey]);
+      const key = String(row[seriesKey] ?? yKey);
+      if (xValue === null || yValue === null || !key) continue;
+      series.add(key);
+      data.push({ [xKey]: xValue, [key]: yValue });
+    }
+    return { data, seriesKeys: [...series] };
+  }
+
   const numericExplicit = (explicitSeries ?? []).filter((key) => isNumericColumn(response.rows, key));
   if (numericExplicit.length || !seriesKey) {
     const yKeys = numericExplicit.length

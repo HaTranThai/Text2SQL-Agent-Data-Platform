@@ -735,6 +735,7 @@ def _deterministic_sql(question: str, max_limit: int) -> str | None:
         or _ma_compare_sql(question, max_limit)
         or _recovery_after_biggest_drop_sql(question, max_limit)
         or _volume_price_correlation_sql(question, max_limit)
+        or _volume_return_scatter_sql(question, max_limit)
         or _month_price_data_sql(question, max_limit)
         or _all_tickers_month_close_sql(question, max_limit)
         or _month_close_sql(question, max_limit)
@@ -1337,6 +1338,36 @@ def _volume_price_correlation_sql(question: str, max_limit: int) -> str | None:
     )
 
 
+def _volume_return_scatter_sql(question: str, max_limit: int) -> str | None:
+    """Paired (volume, daily_return) observations for a scatter plot.
+
+    Triggers on 'scatter / phân tán / scatterplot' + (volume + return/giá thay đổi).
+    Each row = one trading day for one ticker, suitable for a (x=volume, y=daily_return) plot.
+    """
+    if not _asks_for_volume_return_scatter(question):
+        return None
+    tickers = _context_tickers(question) or extract_tickers(question)
+    if not tickers:
+        return None
+    ticker_filter = _ticker_condition(tickers, "c.ticker")
+    if not ticker_filter:
+        return None
+    days = _requested_window_days(question) or 90
+    limit = min(len(tickers) * 250, max_limit)
+    return (
+        "WITH daily AS ("
+        " SELECT c.ticker, c.name, p.date, p.volume, p.close,"
+        " LAG(p.close) OVER (PARTITION BY c.ticker ORDER BY p.date) AS prev_close"
+        " FROM companies c JOIN prices p ON p.company_id = c.id"
+        f" WHERE {ticker_filter} AND p.date >= CURRENT_DATE - INTERVAL '{days} days'"
+        " AND p.volume IS NOT NULL AND p.close IS NOT NULL"
+        ") SELECT ticker, name, date, volume,"
+        " ROUND((((close - prev_close) / NULLIF(prev_close, 0)) * 100)::numeric, 3)::float AS daily_return_pct"
+        " FROM daily WHERE prev_close IS NOT NULL AND prev_close <> 0"
+        f" ORDER BY ticker ASC, date ASC LIMIT {limit}"
+    )
+
+
 def _month_price_data_sql(question: str, max_limit: int) -> str | None:
     tickers = _context_tickers(question) or extract_tickers(question)
     month_window = _requested_month_window(question)
@@ -1825,6 +1856,21 @@ def _asks_for_month_close(question: str) -> bool:
     normalized = _normalize_text(question.lower())
     has_close = any(phrase in normalized for phrase in ["gia dong cua", "close", "closing price"])
     return has_close and _requested_month_window(question) is not None
+
+
+def _asks_for_volume_return_scatter(question: str) -> bool:
+    """Detect scatter-plot requests pairing volume with return."""
+    normalized = _normalize_text(question.lower())
+    has_scatter = any(
+        t in normalized
+        for t in ["scatter", "scatterplot", "phan tan", "bieu do phan tan", "diem phan tan"]
+    )
+    has_volume = "volume" in normalized or "khoi luong" in normalized
+    has_return = any(
+        t in normalized
+        for t in ["return", "loi suat", "loi nhuan", "% thay doi", "tang giam", "daily return", "% tang", "% giam"]
+    )
+    return has_scatter and has_volume and has_return
 
 
 def _asks_for_all_tickers(question: str) -> bool:
