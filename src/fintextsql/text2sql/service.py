@@ -109,10 +109,26 @@ class TextToSQLService:
             question = state["question"]
             knowledge = extract_knowledge(question)                # Knowledge Extractor
             selected_schema = select_schema(question)              # Schema Cache + Schema Selector
-            plan = await service._plan(question, selected_schema, knowledge)  # Planner
-            candidates = await service._generate_candidates(       # SQL Generator → 3 candidates
-                question, selected_schema, plan, knowledge
-            )
+            try:
+                plan = await service._plan(question, selected_schema, knowledge)  # Planner
+                candidates = await service._generate_candidates(   # SQL Generator → 3 candidates
+                    question, selected_schema, plan, knowledge
+                )
+            except LLMError as exc:
+                return {
+                    "knowledge": knowledge.as_prompt(),
+                    "selected_tables": selected_schema.tables,
+                    "error": f"LLM unavailable: {exc}",
+                    "last_error": f"LLM unavailable: {exc}",
+                    "pipeline": [
+                        "load_schema",
+                        "schema_cache",
+                        "knowledge_extractor",
+                        "schema_selector",
+                        "planner",
+                        "sql_generator",
+                    ],
+                }
             return {
                 "knowledge": knowledge.as_prompt(),
                 "selected_tables": selected_schema.tables,
@@ -131,7 +147,15 @@ class TextToSQLService:
             }
 
         def execute(state: T2SState) -> dict[str, Any]:
-            candidates = state.get("candidates") or ([state["sql"]] if state.get("sql") else [])
+            # If build_sql already failed (LLM unavailable), preserve that error
+            # so route_after_execute can short-circuit to fail without losing
+            # context. Don't overwrite with a generic "no candidate" message.
+            existing_error = state.get("error")
+            candidates = state.get("candidates") or (
+                [state.get("sql")] if state.get("sql") else []
+            )
+            if not candidates and existing_error:
+                return {"error": existing_error, "last_error": existing_error}
             multi = len(candidates) > 1
             best: tuple[tuple[int, int], list[dict[str, Any]], list[str], str] | None = None
             last_error: str | None = None
@@ -151,7 +175,7 @@ class TextToSQLService:
                 if not multi:
                     break
             if best is None:
-                message = last_error or "SQL execution returned no usable candidate"
+                message = last_error or existing_error or "SQL execution returned no usable candidate"
                 return {"error": message, "last_error": message}
             _score, rows, columns, sql = best
             # `candidate_selector` always runs (even with 1 candidate it picks "the one");
@@ -164,7 +188,12 @@ class TextToSQLService:
             return {"rows": rows, "columns": columns, "sql": sql, "error": None, "pipeline": pipeline}
 
         def route_after_execute(state: T2SState) -> str:
-            if state.get("error"):
+            err = state.get("error") or ""
+            # If build_sql already failed with LLM unavailable, repair would just
+            # call the same broken LLM again — short-circuit straight to fail.
+            if err.startswith("LLM unavailable") or state.get("attempt", 0) >= 99:
+                return "fail"
+            if err:
                 return "fail" if state.get("attempt", 0) >= 1 else "repair_error"
             rows = state.get("rows") or []
             if (
@@ -177,9 +206,16 @@ class TextToSQLService:
 
         async def repair_error(state: T2SState) -> dict[str, Any]:
             selected_schema = select_schema(state["question"])
-            sql = await service._repair_sql(
-                state["question"], selected_schema, bad_sql=state["sql"], error=state.get("error") or ""
-            )
+            try:
+                sql = await service._repair_sql(
+                    state["question"], selected_schema, bad_sql=state.get("sql") or "", error=state.get("error") or ""
+                )
+            except (LLMError, SQLValidationError) as exc:
+                return {
+                    "attempt": 99,  # force fail route
+                    "last_error": f"Repair Agent failed: {exc}",
+                    "pipeline": ["repair_agent_error"],
+                }
             return {
                 "sql": sql,
                 "candidates": [sql],
@@ -190,12 +226,19 @@ class TextToSQLService:
 
         async def repair_empty(state: T2SState) -> dict[str, Any]:
             selected_schema = select_schema(state["question"])
-            sql = await service._repair_sql(
-                state["question"],
-                selected_schema,
-                bad_sql=state["sql"],
-                error="Query executed successfully but returned no rows.",
-            )
+            try:
+                sql = await service._repair_sql(
+                    state["question"],
+                    selected_schema,
+                    bad_sql=state.get("sql") or "",
+                    error="Query executed successfully but returned no rows.",
+                )
+            except (LLMError, SQLValidationError) as exc:
+                return {
+                    "attempt": 99,
+                    "last_error": f"Repair Agent failed: {exc}",
+                    "pipeline": ["repair_agent_empty"],
+                }
             return {
                 "sql": sql,
                 "candidates": [sql],
@@ -204,12 +247,27 @@ class TextToSQLService:
             }
 
         def fail(state: T2SState) -> dict[str, Any]:
-            # Repair exhausted: return a friendly message instead of raising a 500.
-            return {
-                "answer": (
+            # Repair exhausted OR LLM unavailable: return a friendly, specific
+            # message instead of raising a 500 or silently using a default SQL.
+            last_error = state.get("last_error") or state.get("error") or ""
+            if last_error.startswith("LLM unavailable"):
+                answer = (
+                    "Xin lỗi, LLM endpoint hiện không phản hồi nên mình không sinh được câu SQL cho câu hỏi này. "
+                    "Vui lòng thử lại sau ít phút, hoặc kiểm tra cấu hình `LLM_BASE_URL` / `LLM_API_KEY` trong `.env`."
+                )
+            elif last_error:
+                answer = (
+                    "Xin lỗi, mình đã thử sinh và sửa câu SQL nhưng vẫn lỗi. "
+                    f"Lỗi cuối: {last_error}. "
+                    "Bạn thử diễn đạt cụ thể hơn (mã cổ phiếu, khoảng thời gian, chỉ số cần xem) giúp mình nhé."
+                )
+            else:
+                answer = (
                     "Xin lỗi, mình chưa tạo được truy vấn SQL hợp lệ cho câu hỏi này. "
                     "Bạn thử diễn đạt cụ thể hơn (mã cổ phiếu, khoảng thời gian, chỉ số cần xem) giúp mình nhé."
-                ),
+                )
+            return {
+                "answer": answer,
                 "rows": [],
                 "columns": [],
                 "pipeline": ["fail_handler"],
@@ -247,30 +305,27 @@ class TextToSQLService:
         return graph.compile()
 
     async def _plan(self, question: str, selected_schema: SelectedSchema, knowledge: Knowledge | None = None) -> str:
-        fallback = (
-            "Join companies to the relevant finance table, filter tickers with upper-case symbols, "
-            "choose the latest date when the question asks for current/latest values, and return a small result set."
-        )
+        # No fallback plan — if LLM is down, the pipeline must fail loudly so the
+        # user sees the real cause (LLM unavailable) instead of getting back a
+        # generic SELECT that doesn't answer their question. LLMError propagates
+        # to the build_sql graph node, which routes to the `fail` handler.
         knowledge_block = f"\n\nExtracted knowledge:\n{knowledge.as_prompt()}" if knowledge and knowledge.as_prompt() else ""
-        try:
-            return await self.llm.chat(
-                [
-                    LLMMessage(
-                        "system",
-                        "You are a concise finance data analyst. Produce a short SQL plan, not SQL.",
-                    ),
-                    LLMMessage(
-                        "user",
-                        f"Question:\n{question}\n\nAvailable schema:\n{generation_schema_text()}"
-                        f"\n\nMost relevant tables for this question: {', '.join(selected_schema.tables)}"
-                        f"{knowledge_block}",
-                    ),
-                ],
-                temperature=0,
-                max_tokens=400,
-            )
-        except LLMError:
-            return fallback
+        return await self.llm.chat(
+            [
+                LLMMessage(
+                    "system",
+                    "You are a concise finance data analyst. Produce a short SQL plan, not SQL.",
+                ),
+                LLMMessage(
+                    "user",
+                    f"Question:\n{question}\n\nAvailable schema:\n{generation_schema_text()}"
+                    f"\n\nMost relevant tables for this question: {', '.join(selected_schema.tables)}"
+                    f"{knowledge_block}",
+                ),
+            ],
+            temperature=0,
+            max_tokens=400,
+        )
 
     async def _generate_candidates(
         self,
@@ -282,8 +337,10 @@ class TextToSQLService:
     ) -> list[str]:
         """Generate up to `count` distinct candidate SELECT queries in a single LLM call.
 
-        Returns validated, LIMIT-capped SQL strings; falls back to a heuristic query if the
-        LLM is unavailable or every candidate fails validation.
+        Returns validated, LIMIT-capped SQL strings. Raises LLMError if the LLM is
+        unavailable or every candidate fails the SQL guard — the build_sql graph
+        node catches and routes to the `fail` node so the user gets a clear
+        "LLM unavailable" message instead of a misleading default query.
         """
         knowledge_block = (
             f"\n\nExtracted knowledge:\n{knowledge.as_prompt()}" if knowledge and knowledge.as_prompt() else ""
@@ -299,44 +356,42 @@ class TextToSQLService:
                 "\n\nPast question/SQL pairs that worked here (use them as guidance when relevant; "
                 "adapt tickers/years to the current question):\n" + render_few_shot_block(similar)
             )
-        try:
-            raw = await self.llm.chat(
-                [
-                    LLMMessage(
-                        "system",
-                        "\n".join(
-                            [
-                                "You generate safe PostgreSQL SELECT queries for a finance database.",
-                                f"Propose {count} DISTINCT candidate queries that each fully answer the question.",
-                                "Vary the approach across candidates (e.g. window functions vs CTE vs aggregation) so a selector can pick the best.",
-                                "Output ONLY the SQL, each candidate in its own ```sql fenced block. No prose.",
-                                "Rules for every candidate:",
-                                "- Use only the provided tables and columns.",
-                                "- Never write INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, COPY.",
-                                "- For ticker filters, compare c.ticker to uppercase literals.",
-                                "- Use companies c joined by c.id = table.company_id when needed.",
-                                "- For time-series questions, preserve the requested time window with a date filter.",
-                                "- If the user does NOT specify a time window for a price/volume query, default to the most recent ~365 days (e.g. p.date >= CURRENT_DATE - INTERVAL '365 days'). NEVER return the oldest rows in the table.",
-                                "- When the user mentions an explicit calendar year (e.g. 'năm 2022', 'in 2024'), filter strictly to that year: p.date >= DATE 'YYYY-01-01' AND p.date < DATE 'YYYY+1-01-01'. NEVER substitute another year.",
-                                "- For chartable time-series comparisons, order by date ASC and use enough rows for all tickers.",
-                                f"- Add LIMIT {self.settings.max_sql_rows} unless a smaller limit is explicitly requested.",
-                            ]
-                        ),
+        # LLMError propagates so build_sql can route to the fail node.
+        raw = await self.llm.chat(
+            [
+                LLMMessage(
+                    "system",
+                    "\n".join(
+                        [
+                            "You generate safe PostgreSQL SELECT queries for a finance database.",
+                            f"Propose {count} DISTINCT candidate queries that each fully answer the question.",
+                            "Vary the approach across candidates (e.g. window functions vs CTE vs aggregation) so a selector can pick the best.",
+                            "Output ONLY the SQL, each candidate in its own ```sql fenced block. No prose.",
+                            "Rules for every candidate:",
+                            "- Use only the provided tables and columns.",
+                            "- Never write INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, COPY.",
+                            "- For ticker filters, compare c.ticker to uppercase literals.",
+                            "- Use companies c joined by c.id = table.company_id when needed.",
+                            "- For time-series questions, preserve the requested time window with a date filter.",
+                            "- If the user does NOT specify a time window for a price/volume query, default to the most recent ~365 days (e.g. p.date >= CURRENT_DATE - INTERVAL '365 days'). NEVER return the oldest rows in the table.",
+                            "- When the user mentions an explicit calendar year (e.g. 'năm 2022', 'in 2024'), filter strictly to that year: p.date >= DATE 'YYYY-01-01' AND p.date < DATE 'YYYY+1-01-01'. NEVER substitute another year.",
+                            "- For chartable time-series comparisons, order by date ASC and use enough rows for all tickers.",
+                            f"- Add LIMIT {self.settings.max_sql_rows} unless a smaller limit is explicitly requested.",
+                        ]
                     ),
-                    LLMMessage(
-                        "user",
-                        f"Question:\n{question}\n\nSchema:\n{generation_schema_text()}"
-                        f"\n\nMost relevant tables for this question: {', '.join(selected_schema.tables)}"
-                        f"{knowledge_block}"
-                        f"{few_shot_block}"
-                        f"\n\nPlan:\n{plan}",
-                    ),
-                ],
-                temperature=0.3,
-                max_tokens=1600,
-            )
-        except LLMError:
-            return [self._fallback_sql(question)]
+                ),
+                LLMMessage(
+                    "user",
+                    f"Question:\n{question}\n\nSchema:\n{generation_schema_text()}"
+                    f"\n\nMost relevant tables for this question: {', '.join(selected_schema.tables)}"
+                    f"{knowledge_block}"
+                    f"{few_shot_block}"
+                    f"\n\nPlan:\n{plan}",
+                ),
+            ],
+            temperature=0.3,
+            max_tokens=1600,
+        )
 
         candidates: list[str] = []
         seen: set[str] = set()
@@ -350,7 +405,9 @@ class TextToSQLService:
                 candidates.append(safe)
             if len(candidates) >= count:
                 break
-        return candidates or [self._fallback_sql(question)]
+        if not candidates:
+            raise LLMError("LLM returned no valid SQL candidates after parsing/guard")
+        return candidates
 
     async def _repair_sql(
         self,
@@ -360,32 +417,33 @@ class TextToSQLService:
         bad_sql: str,
         error: str,
     ) -> str:
-        try:
-            repaired = await self.llm.chat(
-                [
-                    LLMMessage(
-                        "system",
-                        "Repair the PostgreSQL SELECT query. Return only SQL. Keep it read-only and limited.",
+        # Raises LLMError / SQLValidationError on failure — the Repair Agent
+        # graph node catches and increments `attempt`; once attempts are
+        # exhausted the graph routes to `fail`. No silent fallback to a
+        # generic query.
+        repaired = await self.llm.chat(
+            [
+                LLMMessage(
+                    "system",
+                    "Repair the PostgreSQL SELECT query. Return only SQL. Keep it read-only and limited.",
+                ),
+                LLMMessage(
+                    "user",
+                    "\n\n".join(
+                        [
+                            f"Question:\n{question}",
+                            f"Schema:\n{generation_schema_text()}",
+                            f"Most relevant tables: {', '.join(selected_schema.tables)}",
+                            f"Bad SQL:\n{bad_sql}",
+                            f"Error or issue:\n{error}",
+                        ]
                     ),
-                    LLMMessage(
-                        "user",
-                        "\n\n".join(
-                            [
-                                f"Question:\n{question}",
-                                f"Schema:\n{generation_schema_text()}",
-                                f"Most relevant tables: {', '.join(selected_schema.tables)}",
-                                f"Bad SQL:\n{bad_sql}",
-                                f"Error or issue:\n{error}",
-                            ]
-                        ),
-                    ),
-                ],
-                temperature=0,
-                max_tokens=800,
-            )
-            return ensure_limit(validate_select_sql(repaired), self.settings.max_sql_rows)
-        except (LLMError, SQLValidationError):
-            return self._fallback_sql(question)
+                ),
+            ],
+            temperature=0,
+            max_tokens=800,
+        )
+        return ensure_limit(validate_select_sql(repaired), self.settings.max_sql_rows)
 
     def _execute(self, sql: str) -> tuple[list[dict[str, Any]], list[str], str]:
         safe_sql = ensure_limit(validate_select_sql(sql), self.settings.max_sql_rows)
@@ -610,31 +668,6 @@ class TextToSQLService:
             return []
         return rows
 
-    def _fallback_sql(self, question: str) -> str:
-        """Minimal LLM-free fallback used only when the LLM call fails entirely.
-
-        Architecture intentionally does NOT use the deterministic SQL builders
-        (per the design in docs/Text2sql_report.docx — Chapter 3): when LLM is
-        unavailable we return a generic price-series query for any extracted
-        ticker over a reasonable date window. Caller will still surface this
-        through SQL Guard, so it's always read-only.
-        """
-        tickers = extract_tickers(question)
-        ticker_cond = _ticker_condition(tickers, "c.ticker")
-        year = _requested_year(question)
-        if year:
-            date_cond: str | None = f"p.date >= DATE '{year}-01-01' AND p.date < DATE '{year + 1}-01-01'"
-        else:
-            window_days = _requested_window_days(question) or 365
-            date_cond = f"p.date >= CURRENT_DATE - INTERVAL '{window_days} days'"
-        filters = [c for c in [ticker_cond, date_cond] if c]
-        where = f"WHERE {' AND '.join(filters)} " if filters else ""
-        limit = _time_series_limit(question, tickers, self.settings.max_sql_rows)
-        return (
-            "SELECT c.ticker, c.name, p.date, p.close, p.volume "
-            "FROM companies c JOIN prices p ON p.company_id = c.id "
-            f"{where}ORDER BY p.date ASC, c.ticker ASC LIMIT {limit}"
-        )
 
 
 def _parse_sql_candidates(raw: str) -> list[str]:
