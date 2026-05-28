@@ -287,6 +287,7 @@ class TextToSQLService:
                                 "- Use companies c joined by c.id = table.company_id when needed.",
                                 "- For time-series questions, preserve the requested time window with a date filter.",
                                 "- If the user does NOT specify a time window for a price/volume query, default to the most recent ~365 days (e.g. p.date >= CURRENT_DATE - INTERVAL '365 days'). NEVER return the oldest rows in the table.",
+                                "- When the user mentions an explicit calendar year (e.g. 'năm 2022', 'in 2024'), filter strictly to that year: p.date >= DATE 'YYYY-01-01' AND p.date < DATE 'YYYY+1-01-01'. NEVER substitute another year.",
                                 "- For chartable time-series comparisons, order by date ASC and use enough rows for all tickers.",
                                 f"- Add LIMIT {self.settings.max_sql_rows} unless a smaller limit is explicitly requested.",
                             ]
@@ -406,6 +407,9 @@ class TextToSQLService:
         deterministic_corr = _deterministic_correlation_explanation(question, rows)
         if deterministic_corr:
             return deterministic_corr
+        deterministic_year_vs_year = _deterministic_year_vs_year_return_explanation(question, rows)
+        if deterministic_year_vs_year:
+            return deterministic_year_vs_year
         deterministic_year_return = _deterministic_year_return_explanation(question, rows)
         if deterministic_year_return:
             return deterministic_year_return
@@ -606,7 +610,12 @@ class TextToSQLService:
                 f"{where}ORDER BY f.market_cap DESC NULLS LAST, f.as_of_date DESC LIMIT 50"
             )
         ticker_cond = _ticker_condition(tickers, "c.ticker")
-        date_cond = _date_condition(question)
+        year = _requested_year(question)
+        if year:
+            # Explicit calendar year ("năm 2022", "in 2024", ...) takes precedence.
+            date_cond: str | None = f"p.date >= DATE '{year}-01-01' AND p.date < DATE '{year + 1}-01-01'"
+        else:
+            date_cond = _date_condition(question)
         if not date_cond:
             # Default to the most recent ~year so a vague "data of X" returns recent rows,
             # not the oldest data in the database.
@@ -685,6 +694,7 @@ def _deterministic_sql(question: str, max_limit: int) -> str | None:
         or _correlation_sql(question, max_limit)
         or _ma_screen_sql(question, max_limit)
         or _ma_series_sql(question, max_limit)
+        or _year_vs_year_return_sql(question, max_limit)
         or _year_return_sql(question, max_limit)
         or _max_drawdown_year_sql(question, max_limit)
         or _ma_compare_sql(question, max_limit)
@@ -1080,6 +1090,43 @@ def _ma_screen_sql(question: str, max_limit: int) -> str | None:
         " FROM ranked GROUP BY ticker, name"
         f") SELECT {', '.join(latest_select)} FROM metrics WHERE {' AND '.join(predicates)} "
         f"ORDER BY ticker ASC LIMIT {min(200, max_limit)}"
+    )
+
+
+def _year_vs_year_return_sql(question: str, max_limit: int) -> str | None:
+    """Compare yearly return across multiple explicit calendar years for the same ticker(s)."""
+    tickers = _context_tickers(question) or extract_tickers(question)
+    if not tickers:
+        return None
+    normalized = _normalize_text(_latest_user_question(question).lower())
+    years = sorted({int(y) for y in re.findall(r"\b(20\d{2})\b", normalized)})
+    if len(years) < 2:
+        return None
+    if not any(
+        phrase in normalized
+        for phrase in ["tang truong", "growth", "loi suat", "return", "phan tram", "%", "tang", "giam"]
+    ):
+        return None
+    ticker_filter = _ticker_condition(tickers, "c.ticker")
+    if not ticker_filter:
+        return None
+    year_list = ", ".join(str(y) for y in years)
+    limit = min(max(len(tickers) * len(years), len(years)), max_limit)
+    return (
+        "WITH yearly AS ("
+        " SELECT c.ticker, c.name, EXTRACT(YEAR FROM p.date)::int AS year, p.date, p.close,"
+        " ROW_NUMBER() OVER (PARTITION BY c.ticker, EXTRACT(YEAR FROM p.date) ORDER BY p.date ASC) AS rn_start,"
+        " ROW_NUMBER() OVER (PARTITION BY c.ticker, EXTRACT(YEAR FROM p.date) ORDER BY p.date DESC) AS rn_end"
+        " FROM companies c JOIN prices p ON p.company_id = c.id"
+        f" WHERE {ticker_filter} AND EXTRACT(YEAR FROM p.date) IN ({year_list})"
+        ") SELECT ticker, name, year,"
+        " MAX(CASE WHEN rn_start = 1 THEN date END) AS start_date,"
+        " MAX(CASE WHEN rn_start = 1 THEN close END) AS start_close,"
+        " MAX(CASE WHEN rn_end = 1 THEN date END) AS end_date,"
+        " MAX(CASE WHEN rn_end = 1 THEN close END) AS end_close,"
+        " ROUND((((MAX(CASE WHEN rn_end = 1 THEN close END) - MAX(CASE WHEN rn_start = 1 THEN close END)) / "
+        "NULLIF(MAX(CASE WHEN rn_start = 1 THEN close END), 0)) * 100)::numeric, 2)::float AS return_pct"
+        f" FROM yearly GROUP BY ticker, name, year ORDER BY ticker, year LIMIT {limit}"
     )
 
 
@@ -1552,15 +1599,20 @@ def _price_series_sql(question: str, max_limit: int) -> str | None:
     if not tickers or not _asks_for_price_series(question_l) or _should_defer_to_llm(question):
         return None
 
-    days = _requested_window_days(question) or 30
     ticker_filter = _ticker_condition(tickers, "c.ticker")
     if not ticker_filter:
         return None
     limit = _time_series_limit(question, tickers, max_limit)
+    year = _requested_year(question)
+    if year:
+        date_clause = f"AND p.date >= DATE '{year}-01-01' AND p.date < DATE '{year + 1}-01-01'"
+    else:
+        days = _requested_window_days(question) or 30
+        date_clause = f"AND p.date >= CURRENT_DATE - INTERVAL '{days} days'"
     return (
         "SELECT c.ticker, c.name, p.date, p.close "
         "FROM companies c JOIN prices p ON p.company_id = c.id "
-        f"WHERE {ticker_filter} AND p.date >= CURRENT_DATE - INTERVAL '{days} days' "
+        f"WHERE {ticker_filter} {date_clause} "
         f"ORDER BY p.date ASC, c.ticker ASC LIMIT {limit}"
     )
 
@@ -1703,10 +1755,10 @@ def _asks_for_price_series(question_l: str) -> bool:
         phrase in question_l
         for phrase in ["close price", "closing price", "giá đóng cửa", "gia dong cua", "close", "giá", "gia"]
     ) or any(phrase in normalized for phrase in ["close price", "closing price", "gia dong cua", "close", "gia"])
-    has_series_intent = any(
-        phrase in question_l
-        for phrase in ["so sánh", "so sanh", "compare", "chart", "biểu đồ", "bieu do", "vẽ", "ve", "plot"]
-    ) or any(phrase in normalized for phrase in ["so sanh", "compare", "chart", "bieu do", "ve", "plot"])
+    # Use word-boundary matching so short tokens like "ve" don't trigger on words
+    # such as "override" inside the planner's task-contract text.
+    series_pattern = re.compile(r"\b(so sanh|so sánh|compare|chart|biểu đồ|bieu do|vẽ|ve|plot)\b")
+    has_series_intent = bool(series_pattern.search(question_l) or series_pattern.search(normalized))
     return has_price and has_series_intent
 
 
@@ -2294,6 +2346,45 @@ def _deterministic_correlation_explanation(question: str, rows: list[dict[str, A
             "- `|daily return|` đo độ lớn biến động giá trong ngày, phù hợp hơn khi hỏi volume liên quan tới biến động mạnh/yếu.",
         ]
     )
+
+
+def _deterministic_year_vs_year_return_explanation(question: str, rows: list[dict[str, Any]]) -> str | None:
+    if not rows or not {"ticker", "year", "return_pct", "start_close", "end_close"}.issubset(rows[0]):
+        return None
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if row.get("ticker") is None or row.get("year") is None:
+            continue
+        grouped.setdefault(str(row["ticker"]), []).append(row)
+    if not grouped:
+        return None
+    lines = ["So sánh tăng trưởng giá đóng cửa theo từng năm:", ""]
+    for ticker, ticker_rows in sorted(grouped.items()):
+        ordered = sorted(ticker_rows, key=lambda row: int(row.get("year") or 0))
+        lines.append(f"### {ticker}")
+        for row in ordered:
+            year = row.get("year")
+            start_close = row.get("start_close")
+            end_close = row.get("end_close")
+            return_pct = row.get("return_pct")
+            if start_close is None or end_close is None or return_pct is None:
+                lines.append(f"- Năm {year}: không đủ dữ liệu trong DB.")
+                continue
+            lines.append(
+                f"- Năm {year}: {_format_number(float(start_close))} ({str(row.get('start_date'))[:10]}) "
+                f"→ {_format_number(float(end_close))} ({str(row.get('end_date'))[:10]}), "
+                f"return {_format_percent(float(return_pct))}."
+            )
+        valid = [r for r in ordered if r.get("return_pct") is not None]
+        if len(valid) >= 2:
+            best = max(valid, key=lambda r: float(r["return_pct"]))
+            worst = min(valid, key=lambda r: float(r["return_pct"]))
+            lines.append(
+                f"- Tăng trưởng cao hơn: **năm {best['year']}** ({_format_percent(float(best['return_pct']))} "
+                f"vs năm {worst['year']} {_format_percent(float(worst['return_pct']))})."
+            )
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def _deterministic_year_return_explanation(question: str, rows: list[dict[str, Any]]) -> str | None:

@@ -137,9 +137,11 @@ async def chat(
         conversation_context=conversation_context,
     )
     if len(agent_plan.tasks) == 1 and decision.intent in {"text_to_sql", "visualization"}:
+        # Use only the planner's task message (already carries Context tickers + metric +
+        # time_window). Do NOT append conversation_context here — it leaks trigger words
+        # like "volume" or "max" from prior result summaries and causes deterministic
+        # builders to fire on the wrong intent.
         effective_message = agent_plan.tasks[0].message
-        if conversation_context:
-            effective_message = "\n\n".join([effective_message, conversation_context])
     llm = LLMClient(current_settings)
     text_to_sql = TextToSQLService(db, current_settings, llm)
 
@@ -1079,6 +1081,24 @@ def _rewrite_follow_up(session_id: str | None, message: str) -> str | None:
     new_tickers = extract_tickers(message)
     has_metric = _has_metric_term(text)
     is_window_swap = bool(new_window) and not new_tickers and not has_metric
+    # Multi-period reference: "2 năm này", "các năm này", "cả 2 năm", "những năm trên"...
+    is_multi_period = bool(
+        re.search(r"\b(\d{1,2}|cac|nhung|ca|hai|ba)\s+nam\s+(nay|do|tren)\b", text)
+        or "cac nam" in text or "nhung nam" in text or "ca hai nam" in text
+    )
+
+    # Case E: multi-period growth/return comparison referring back across several turns.
+    if is_multi_period and has_metric and not new_tickers:
+        history = SESSION_HISTORY.get(session_id, [])
+        prior_years: list[int] = []
+        for turn in history[-6:]:
+            for raw_year in re.findall(r"\b(20\d{2})\b", str(turn.get("user", ""))):
+                year_val = int(raw_year)
+                if year_val not in prior_years:
+                    prior_years.append(year_val)
+        if len(prior_years) >= 2:
+            years_phrase = " và ".join(f"năm {y}" for y in sorted(prior_years)[:3])
+            return f"{message} của {', '.join(old_tickers)} giữa {years_phrase}"
 
     if not (is_compare or is_continuation or is_pronoun or is_window_swap):
         return None
