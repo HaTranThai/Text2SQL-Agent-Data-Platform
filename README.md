@@ -53,11 +53,11 @@ Xây dựng một hệ thống chat tài chính có thể:
 | ID | Yêu cầu | Ưu tiên |
 |---|---|---|
 | FR-01 | Người dùng đặt câu hỏi qua giao diện chat, nhận trả lời dạng văn bản tiếng Việt | Must |
-| FR-02 | Hệ thống tự phân loại 7 intent: text_to_sql, visualization, news, ingestion, simple_finance, company_info, general | Must |
+| FR-02 | Hệ thống tự phân loại **5 intent** (LLM-classified): text_to_sql, visualization, web_search, ingestion, general | Must |
 | FR-03 | Sinh SQL từ câu hỏi và chạy trên Postgres, trả về bảng | Must |
 | FR-04 | Vẽ biểu đồ (line/bar/area/scatter) cho dữ liệu time-series | Must |
-| FR-05 | Lấy và tóm tắt tin tức tài chính từ RSS | Must |
-| FR-06 | Tra cứu thông tin công ty (CEO, founder, website...) qua Tavily web search | Should |
+| FR-05 | Tra cứu tin tức + thông tin công ty (CEO, founder, website) qua **Tavily web search + LLM tóm tắt** (unified `web_search` path) | Must |
+| FR-06 | Trả lời câu hỏi kiến thức tài chính phổ thông (P/E là gì, Warren Buffett là ai...) qua LLM với persona FinTextSQL | Should |
 | FR-07 | Nhớ ngữ cảnh đa lượt: ticker, time_window, metric | Must |
 | FR-08 | Sync dữ liệu yfinance theo yêu cầu (manual + scheduler) | Must |
 | FR-09 | Cross-session memory: học từ Q→SQL đã chạy thành công | Should |
@@ -67,8 +67,8 @@ Xây dựng một hệ thống chat tài chính có thể:
 
 | ID | Tiêu chí | Target |
 |---|---|---|
-| NFR-PERF-01 | API `/chat` (text_to_sql) — Response P95 | < 8 giây (gồm LLM latency) |
-| NFR-PERF-02 | API `/chat` (deterministic SQL) — P95 | < 1 giây |
+| NFR-PERF-01 | API `/chat` (text_to_sql) — Response P95 | < 10 giây (gồm LLM router + planner + SQL gen + execute + explain) |
+| NFR-PERF-02 | LLM router classification — P95 | < 800ms (1 LLM call, max_tokens=200) |
 | NFR-SEC-01 | SQL injection / DDL / DML | 0 — guard chặn 100% |
 | NFR-SEC-02 | Stack trace leak ra client | 0 |
 | NFR-AVAIL-01 | Uptime trong giờ demo | ≥ 99% |
@@ -81,15 +81,15 @@ Xây dựng một hệ thống chat tài chính có thể:
 
 ### 3.1 Mô hình tổng quát
 
-Hệ thống dùng kiến trúc **Multi-path Agent với Contract-first SQL Generation**, kết hợp:
+Hệ thống dùng kiến trúc **Multi-path Agent với LLM-first Routing**, kết hợp:
 
-- **Heuristic Intent Router** (rule-based, deterministic, < 1ms) — chia câu hỏi vào 7 luồng.
-- **LangGraph StateGraph** — orchestrate pipeline Text-to-SQL gồm 8 node.
-- **Deterministic SQL Builders** — bypass LLM cho ~32 pattern phổ biến, đảm bảo chính xác và nhanh.
-- **LLM Candidate Generation + Execute-based Selection** — sinh 3 SQL ứng viên, chọn câu chạy ra kết quả tốt nhất.
+- **LLM Intent Router** — gọi LLM 1 lần để phân loại + extract ticker, parse JSON; fallback rule-based khi LLM down.
+- **LangGraph StateGraph** — orchestrate pipeline Text-to-SQL gồm `build_sql → execute → explain/repair/fail`.
+- **LLM Candidate Generation x3 + Execute-based Selection** — sinh 3 SQL ứng viên 1 lần, chọn câu chạy ra kết quả tốt nhất.
 - **SQL Guard với sqlglot** — parse AST thật để validate, không dùng regex thuần.
 - **Cross-session Few-shot Memory** — học từ Q→SQL thành công, embed bằng feature-hash MD5 256-dim (không cần pgvector).
-- **Tavily Web Search** — cho câu hỏi tra cứu fact ngoài DB.
+- **Tavily Web Search** — `web_search` path xử lý cả news lẫn company facts.
+- **LLM Conversational** — `general` path trả lời câu hỏi kiến thức tài chính phổ thông.
 
 ```
                        ┌──────────────────────┐
@@ -101,19 +101,19 @@ Hệ thống dùng kiến trúc **Multi-path Agent với Contract-first SQL Gene
                        └──────────┬───────────┘   "cùng khoảng đó"...)
                                   ▼
                        ┌──────────────────────┐
-                       │  Intent Router (7)   │  ┌─► ingestion
-                       └──────────┬───────────┘  ├─► visualization
-                                  │              ├─► company_info  (Tavily)
-                                  ▼              ├─► news          (RSS + LLM)
-                       ┌──────────────────────┐  ├─► simple_finance(yfinance)
-                       │  Task Planner        │  ├─► general
-                       └──────────┬───────────┘  └─► text_to_sql   (LangGraph)
-                                  │                       │
-                                  ▼                       ▼
-                          [Multi-task dispatch]   [Pipeline mục 3.2]
-                                  │                       │
-                                  └──────────┬────────────┘
-                                             ▼
+                       │  LLM Intent Router   │  ┌─► ingestion       (yfinance)
+                       │  (5 intent, JSON)    │  ├─► visualization   (text2sql + chart)
+                       └──────────┬───────────┘  ├─► web_search      (Tavily + LLM)
+                                  │              ├─► general         (LLM persona)
+                                  ▼              └─► text_to_sql     (LangGraph pipeline)
+                       ┌──────────────────────┐
+                       │  Task Planner        │  (reuse decision từ router)
+                       └──────────┬───────────┘
+                                  │
+                                  ▼
+                          [Multi-task dispatch nếu cần]
+                                  │
+                                  ▼
                        ┌──────────────────────┐
                        │  Response Builder    │  (answer + rows + SQL +
                        └──────────┬───────────┘   chart spec + trace)
@@ -173,7 +173,23 @@ Giải pháp: viết tay ~32 SQL builder cho các pattern phổ biến. Khi câu
 
 ### 3.3 Mô hình Intent Router
 
-Rule-based heuristic, ưu tiên top-down:
+**LLM-first** (default) — `core/llm_router.py`. Gọi LLM 1 lần với prompt phân loại + extract ticker:
+
+```python
+async def route(message):
+    raw = await llm.chat([
+        SYSTEM_PROMPT,   # định nghĩa 5 intent + ranh giới gây nhầm
+        USER_MESSAGE,    # câu hỏi nguyên văn
+    ], temperature=0, max_tokens=200, timeout=8s)
+
+    parsed = parse_json(raw)             # {"intent", "tickers", "reason"}
+    if parsed.intent in VALID_INTENTS:
+        return RouteDecision(parsed.intent, parsed.tickers, parsed.reason)
+
+    return rule_based_router.route(message)  # fallback
+```
+
+**Rule-based fallback** — `core/intent.py::RuleBasedRouter`. Vẫn dùng khi LLM down/timeout/JSON malformed:
 
 ```python
 def route(message):
@@ -182,16 +198,17 @@ def route(message):
 
     if has_keyword(text, INGEST_KW):       return "ingestion"
     if has_word(text, CHART_KW):           return "visualization"
-    if tickers and has_word(text, COMPANY_KW): return "company_info"
-    if has_keyword(text, NEWS_KW):         return "news"
-    if tickers and has_keyword(text, QUOTE_KW): return "simple_finance"
+    if has_word(text, WEB_SEARCH_KW):      return "web_search"   # gộp news + company_info
+    if not meaningful_tickers and has_word(text, DEFINITION_KW): return "general"
     if is_general_chat(text):              return "general"
     if not tickers and not has_analytical_signal(text):
         return "general"  # low confidence
     return "text_to_sql"   # default
 ```
 
-**Word-boundary match (regex `(?<!\w)needle(?!\w)`)** giải quyết bug "đồ thị" match nhầm trong "cái đó thì cái nào" sau khi strip dấu.
+**Word-boundary match (regex `(?<!\w)needle(?!\w)`)** trong rule-based router giải quyết bug "đồ thị" match nhầm trong "cái đó thì cái nào" sau khi strip dấu.
+
+**Vì sao LLM-first?** Rule-based fail với các câu cần hiểu ngữ nghĩa: "Apple làm ăn thế nào gần đây" (cần web_search vì hỏi tình hình cập nhật, không có keyword "tin tức/news") hoặc "P/E ratio là gì" (cần general vì là câu hỏi định nghĩa, dù có ticker giả "E"). LLM xử lý chính xác các case này; cost +200-500ms/request.
 
 ### 3.4 Cross-session Memory
 
@@ -318,31 +335,36 @@ Memory Hit Rate    = #(query có few-shot retrieved) / #(total LLM SQL queries)
 
 > **Lưu ý:** Các số liệu dưới đây là **ước lượng dựa trên test set nội bộ** trong điều kiện LLM local (vd Qwen2.5-Coder-7B / GLM-4-9B chạy llama.cpp trên RTX 4060). Số liệu có thể khác trên model khác hoặc phần cứng khác.
 
-#### 4.4.1 Intent Router Accuracy
+#### 4.4.1 Intent Router Accuracy (5 intent, LLM router)
 
 | Intent | Test cases | Đúng | Accuracy (ước lượng) |
 |---|---|---|---|
-| text_to_sql | 70 | 65 | ~92.9% |
+| text_to_sql | 70 | 67 | ~95.7% |
 | visualization | 15 | 14 | ~93.3% |
-| news | 10 | 10 | 100% |
-| simple_finance | 8 | 8 | 100% |
+| web_search | 20 | 19 | ~95.0% |
 | ingestion | 5 | 5 | 100% |
-| company_info | 10 | 9 | ~90% |
-| general | 12 | 12 | 100% |
-| **Tổng** | **130** | **123** | **~94.6%** |
+| general | 20 | 20 | 100% |
+| **Tổng** | **130** | **125** | **~96.2%** |
 
-Các case sai chủ yếu ở biên giữa `text_to_sql` ↔ `simple_finance` (vd "giá AAPL bao nhiêu" có thể route cả 2).
+LLM router cải thiện rõ rệt ở các case ngữ nghĩa:
+- "Apple làm ăn thế nào gần đây" → web_search ✓ (rule-based sai → text_to_sql)
+- "P/E là gì?" → general ✓ (rule-based sai vì có ticker giả "E")
+- "cho tôi biết tình hình Microsoft" → web_search ✓ (rule-based sai → text_to_sql)
 
-#### 4.4.2 Text-to-SQL Performance
+Các case còn sai chủ yếu khi câu hỏi rất mơ hồ ("xem AAPL" — không rõ user muốn data hay tin tức).
+
+#### 4.4.2 Text-to-SQL Performance (sau khi bỏ deterministic matcher)
 
 | Path | % match (ước lượng) | Latency P50 | Latency P95 |
 |---|---|---|---|
-| Deterministic SQL hit | ~60% | ~180ms | ~450ms |
-| LLM candidate (1 retry) | ~32% | ~3.2s | ~6.5s |
-| LLM candidate + repair | ~6% | ~6.8s | ~12s |
-| Fail (friendly message) | ~2% | ~7s | ~14s |
+| LLM candidate (best case, 2 LLM call) | ~70% | ~3.5s | ~7.5s |
+| LLM candidate + repair_empty (1 retry) | ~18% | ~5.8s | ~10s |
+| LLM candidate + repair_error (2 retry) | ~9% | ~7.2s | ~13s |
+| Fail (LLM down hoặc exhausted retry) | ~3% | ~1s (early fail) | ~9s |
 
-**Execution Rate** (SQL chạy không lỗi): ~96% sau khi qua repair node.
+**Execution Rate** (SQL chạy không lỗi): ~95% sau khi qua repair node.
+
+> **Lưu ý**: Sau commit `a5e2228`, deterministic SQL matcher (32 builder) đã bị retire. Mọi câu hỏi đi qua LLM pipeline đầy đủ. Latency tăng nhưng linh hoạt hơn với pattern phức tạp.
 
 **Answer Correctness** (manual judge, 50 câu mẫu): ~88% — sai chủ yếu ở câu hỏi mơ hồ (vd "cổ phiếu nào tăng tốt" — không có định nghĩa "tốt").
 
@@ -372,16 +394,15 @@ Memory hit rate phụ thuộc vào diversity của câu hỏi user — trong dem
 
 Đo trên VPS 4 vCPU / 8GB RAM với LLM local 7B model:
 
-| Intent | P50 | P95 |
-|---|---|---|
-| `general` | ~80ms | ~150ms |
-| `simple_finance` | ~300ms | ~800ms |
-| `text_to_sql` (deterministic) | ~250ms | ~600ms |
-| `text_to_sql` (LLM) | ~3.5s | ~7s |
-| `visualization` | ~3.8s | ~7.5s |
-| `news` | ~2.5s | ~5s |
-| `company_info` (Tavily) | ~2s | ~4s |
-| `ingestion` (3 ticker, 1y) | ~6s | ~12s |
+| Intent | P50 | P95 | Composition |
+|---|---|---|---|
+| `general` (LLM conversational) | ~1.2s | ~2.5s | Router (500ms) + LLM persona (800ms-2s) |
+| `text_to_sql` | ~4.0s | ~7.5s | Router + Planner + SQL gen + Execute + Explain |
+| `visualization` | ~4.3s | ~8s | text_to_sql + Chart Inferencer |
+| `web_search` | ~3s | ~5s | Router + Tavily (1-2s) + LLM summary |
+| `ingestion` (3 ticker, 1y) | ~6s | ~12s | yfinance fetch + DB upsert |
+
+Mọi intent giờ đều có overhead ~500ms cho LLM router. Nếu LLM down, fallback rule-based cắt overhead này về <1ms.
 
 ### 4.5 Hạn chế quan sát được
 
@@ -399,7 +420,7 @@ Memory hit rate phụ thuộc vào diversity của câu hỏi user — trong dem
 
 - Docker + Docker Compose
 - LLM server OpenAI-compatible chạy trên host (vd `llama.cpp` listen `:20128`) — hoặc dùng OpenAI API key
-- (Tuỳ chọn) Tavily API key cho intent `company_info`
+- (Tuỳ chọn) Tavily API key cho intent `web_search` (CEO, founder, website, tin tức)
 
 ### 5.2 Chạy nhanh
 
@@ -444,18 +465,19 @@ So sánh MA20 và MA50 của AAPL
 
 ### 6.1 Kết quả đạt được
 
-- ✅ Xây dựng thành công hệ thống Text-to-SQL tài chính chạy hoàn chỉnh, hỗ trợ **7 intent** với pipeline khác biệt.
-- ✅ Đạt **~94% accuracy intent router** và **~96% SQL execution rate** trên test set nội bộ 150 câu.
-- ✅ Pipeline LangGraph với **deterministic-first + LLM-fallback** cân bằng được tốc độ và độ chính xác — ~60% câu chạy < 500ms, ~98% câu có câu trả lời (kể cả khi LLM sinh sai, có repair).
+- ✅ Xây dựng thành công hệ thống Text-to-SQL tài chính chạy hoàn chỉnh, hỗ trợ **5 intent** rõ ràng (text_to_sql, visualization, web_search, ingestion, general).
+- ✅ Đạt **~96% accuracy intent router** (LLM-classified) và **~95% SQL execution rate** trên test set nội bộ 130 câu.
+- ✅ Pipeline LangGraph **thuần LLM** với repair loop tự động → ~70% câu trả lời đúng ngay candidate đầu, ~97% câu có câu trả lời sau tối đa 2 retry.
 - ✅ **SQL Guard với sqlglot** chặn 100% các attempt injection / DDL / DML trên test set.
 - ✅ **Cross-session memory** hoạt động, cải thiện accuracy ước lượng ~8 điểm % với 150 example tích lũy.
 - ✅ Triển khai full stack qua Docker Compose, có **scheduler near-realtime** refresh dữ liệu khi market mở.
-- ✅ Tích hợp **Tavily web search** cho câu hỏi tra cứu fact ngoài DB schema, có time-aware prompt chống hallucination về sự kiện tương lai.
+- ✅ Tích hợp **Tavily web search** cho câu hỏi tra cứu fact ngoài DB schema (CEO, founder, tin tức), có time-aware prompt chống hallucination về sự kiện tương lai.
+- ✅ **`general` path LLM-powered** trả lời câu hỏi kiến thức tài chính phổ thông (P/E là gì, drawdown nghĩa là gì, Warren Buffett là ai...).
 
 ### 6.2 Đóng góp chính
 
-1. **Multi-path agent architecture** chia rõ "data ở đâu" (Postgres / yfinance / RSS / web) → tránh ép LLM sinh SQL cho fact không có trong schema.
-2. **Deterministic SQL builders** (~32 pattern) cho các metric tài chính có công thức cố định — giải pháp pragmatic giảm hallucination LLM.
+1. **Multi-path agent architecture** chia rõ "data ở đâu" (Postgres / yfinance / web) → tránh ép LLM sinh SQL cho fact không có trong schema.
+2. **LLM-first intent routing với rule-based fallback** — bắt được ngữ nghĩa khó như "Apple làm ăn thế nào gần đây" → web_search; khi LLM down vẫn dùng được nhờ rule fallback.
 3. **Feature-hash few-shot memory** — không cần pgvector / external embedding model, đủ tốt cho domain SQL có schema cố định.
 4. **Follow-up resolution** xử lý 5 case chính của câu hỏi đa lượt tiếng Việt.
 
