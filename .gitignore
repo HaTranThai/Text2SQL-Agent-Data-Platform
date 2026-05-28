@@ -13,3 +13,4 @@ frontend/*.tsbuildinfo
 frontend/vite.config.d.ts
 frontend/vite.config.js
 postgres-data/
+logs/
