@@ -104,15 +104,16 @@ class TextToSQLService:
         async def build_sql(state: T2SState) -> dict[str, Any]:
             # Pipeline phases (matches architecture diagram in docs/Text2sql_report):
             #   load_schema → schema_cache (lru_cache hit) → knowledge_extractor
-            #   → schema_selector → planner → sql_generator → candidate_generator_x3
-            # Candidate selector + execute happen in the `execute` node.
+            #   → schema_selector → sql_generator (1 candidate by default)
+            # Planner step has been inlined into sql_generator's system prompt
+            # to save a full LLM round-trip (~2-3s). The repair_error node still
+            # falls back to generating 3 candidates if the first one fails.
             question = state["question"]
             knowledge = extract_knowledge(question)                # Knowledge Extractor
             selected_schema = select_schema(question)              # Schema Cache + Schema Selector
             try:
-                plan = await service._plan(question, selected_schema, knowledge)  # Planner
-                candidates = await service._generate_candidates(   # SQL Generator → 3 candidates
-                    question, selected_schema, plan, knowledge
+                candidates = await service._generate_candidates(
+                    question, selected_schema, plan="", knowledge=knowledge, count=1
                 )
             except LLMError as exc:
                 return {
@@ -125,14 +126,13 @@ class TextToSQLService:
                         "schema_cache",
                         "knowledge_extractor",
                         "schema_selector",
-                        "planner",
                         "sql_generator",
                     ],
                 }
             return {
                 "knowledge": knowledge.as_prompt(),
                 "selected_tables": selected_schema.tables,
-                "plan": plan,
+                "plan": "",
                 "sql": candidates[0],
                 "candidates": candidates,
                 "pipeline": [
@@ -140,9 +140,7 @@ class TextToSQLService:
                     "schema_cache",
                     "knowledge_extractor",
                     "schema_selector",
-                    "planner",
                     "sql_generator",
-                    "candidate_generator_x3",
                 ],
             }
 
@@ -207,23 +205,28 @@ class TextToSQLService:
             return "explain"
 
         async def repair_error(state: T2SState) -> dict[str, Any]:
-            selected_schema = select_schema(state["question"])
+            # On first repair: re-generate with 3 diverse candidates instead of
+            # calling _repair_sql with a single fix-the-bad-SQL prompt. Diverse
+            # candidates often work better than patching a wrong query.
+            question = state["question"]
+            knowledge = extract_knowledge(question)
+            selected_schema = select_schema(question)
             try:
-                sql = await service._repair_sql(
-                    state["question"], selected_schema, bad_sql=state.get("sql") or "", error=state.get("error") or ""
+                candidates = await service._generate_candidates(
+                    question, selected_schema, plan="", knowledge=knowledge, count=3
                 )
             except (LLMError, SQLValidationError) as exc:
                 return {
-                    "attempt": 99,  # force fail route
+                    "attempt": 99,
                     "last_error": f"Repair Agent failed: {exc}",
-                    "pipeline": ["repair_agent_error"],
+                    "pipeline": ["repair_agent_error_fan_out"],
                 }
             return {
-                "sql": sql,
-                "candidates": [sql],
+                "sql": candidates[0],
+                "candidates": candidates,
                 "attempt": state.get("attempt", 0) + 1,
                 "error": None,
-                "pipeline": ["repair_agent_error"],
+                "pipeline": ["repair_agent_error_fan_out"],
             }
 
         async def repair_empty(state: T2SState) -> dict[str, Any]:
@@ -359,40 +362,43 @@ class TextToSQLService:
                 "adapt tickers/years to the current question):\n" + render_few_shot_block(similar)
             )
         # LLMError propagates so build_sql can route to the fail node.
+        # Tokens scale with count: 1 candidate ~500 tokens, 3 candidates ~1500.
+        is_single = count == 1
+        plan_block = f"\n\nPlan:\n{plan}" if plan else ""
+        system_lines = [
+            "You generate safe PostgreSQL SELECT queries for a finance database.",
+            (
+                "Output ONE SQL query in a single ```sql fenced block. No prose, no plan, no explanation."
+                if is_single
+                else f"Propose {count} DISTINCT candidate queries that each fully answer the question."
+                + " Vary the approach across candidates (window functions vs CTE vs aggregation) so a selector can pick the best."
+                + " Output ONLY the SQL, each candidate in its own ```sql fenced block. No prose."
+            ),
+            "Rules:",
+            "- Use only the provided tables and columns.",
+            "- Never write INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, COPY.",
+            "- For ticker filters, compare c.ticker to uppercase literals.",
+            "- Use companies c joined by c.id = table.company_id when needed.",
+            "- For time-series questions, preserve the requested time window with a date filter.",
+            "- If the user does NOT specify a time window for a price/volume query, default to the most recent ~365 days (e.g. p.date >= CURRENT_DATE - INTERVAL '365 days'). NEVER return the oldest rows in the table.",
+            "- When the user mentions an explicit calendar year (e.g. 'năm 2022', 'in 2024'), filter strictly to that year: p.date >= DATE 'YYYY-01-01' AND p.date < DATE 'YYYY+1-01-01'. NEVER substitute another year.",
+            "- For chartable time-series comparisons, order by date ASC and use enough rows for all tickers.",
+            f"- Add LIMIT {self.settings.max_sql_rows} unless a smaller limit is explicitly requested.",
+        ]
         raw = await self.llm.chat(
             [
-                LLMMessage(
-                    "system",
-                    "\n".join(
-                        [
-                            "You generate safe PostgreSQL SELECT queries for a finance database.",
-                            f"Propose {count} DISTINCT candidate queries that each fully answer the question.",
-                            "Vary the approach across candidates (e.g. window functions vs CTE vs aggregation) so a selector can pick the best.",
-                            "Output ONLY the SQL, each candidate in its own ```sql fenced block. No prose.",
-                            "Rules for every candidate:",
-                            "- Use only the provided tables and columns.",
-                            "- Never write INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, COPY.",
-                            "- For ticker filters, compare c.ticker to uppercase literals.",
-                            "- Use companies c joined by c.id = table.company_id when needed.",
-                            "- For time-series questions, preserve the requested time window with a date filter.",
-                            "- If the user does NOT specify a time window for a price/volume query, default to the most recent ~365 days (e.g. p.date >= CURRENT_DATE - INTERVAL '365 days'). NEVER return the oldest rows in the table.",
-                            "- When the user mentions an explicit calendar year (e.g. 'năm 2022', 'in 2024'), filter strictly to that year: p.date >= DATE 'YYYY-01-01' AND p.date < DATE 'YYYY+1-01-01'. NEVER substitute another year.",
-                            "- For chartable time-series comparisons, order by date ASC and use enough rows for all tickers.",
-                            f"- Add LIMIT {self.settings.max_sql_rows} unless a smaller limit is explicitly requested.",
-                        ]
-                    ),
-                ),
+                LLMMessage("system", "\n".join(system_lines)),
                 LLMMessage(
                     "user",
                     f"Question:\n{question}\n\nSchema:\n{generation_schema_text()}"
                     f"\n\nMost relevant tables for this question: {', '.join(selected_schema.tables)}"
                     f"{knowledge_block}"
                     f"{few_shot_block}"
-                    f"\n\nPlan:\n{plan}",
+                    f"{plan_block}",
                 ),
             ],
-            temperature=0.3,
-            max_tokens=1600,
+            temperature=0.2 if is_single else 0.3,
+            max_tokens=600 if is_single else 1600,
         )
 
         candidates: list[str] = []
