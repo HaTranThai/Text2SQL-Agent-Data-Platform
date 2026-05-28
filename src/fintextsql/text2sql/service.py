@@ -286,6 +286,7 @@ class TextToSQLService:
                                 "- For ticker filters, compare c.ticker to uppercase literals.",
                                 "- Use companies c joined by c.id = table.company_id when needed.",
                                 "- For time-series questions, preserve the requested time window with a date filter.",
+                                "- If the user does NOT specify a time window for a price/volume query, default to the most recent ~365 days (e.g. p.date >= CURRENT_DATE - INTERVAL '365 days'). NEVER return the oldest rows in the table.",
                                 "- For chartable time-series comparisons, order by date ASC and use enough rows for all tickers.",
                                 f"- Add LIMIT {self.settings.max_sql_rows} unless a smaller limit is explicitly requested.",
                             ]
@@ -604,9 +605,14 @@ class TextToSQLService:
                 "FROM companies c JOIN fundamentals f ON f.company_id = c.id "
                 f"{where}ORDER BY f.market_cap DESC NULLS LAST, f.as_of_date DESC LIMIT 50"
             )
-        filters = [
-            condition for condition in [_ticker_condition(tickers, "c.ticker"), _date_condition(question)] if condition
-        ]
+        ticker_cond = _ticker_condition(tickers, "c.ticker")
+        date_cond = _date_condition(question)
+        if not date_cond:
+            # Default to the most recent ~year so a vague "data of X" returns recent rows,
+            # not the oldest data in the database.
+            default_days = _requested_window_days(question) or 365
+            date_cond = f"p.date >= CURRENT_DATE - INTERVAL '{default_days} days'"
+        filters = [condition for condition in [ticker_cond, date_cond] if condition]
         where = f"WHERE {' AND '.join(filters)} " if filters else ""
         return (
             "SELECT c.ticker, c.name, p.date, p.close, p.volume "
