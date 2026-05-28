@@ -6,8 +6,10 @@ from datetime import datetime, timezone
 from typing import Any
 from unicodedata import category, normalize
 
+import json
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -309,6 +311,87 @@ async def chat(
         return response
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/chat/stream")
+async def chat_stream(
+    payload: ChatRequest,
+    db: Session = Depends(get_db),
+    current_settings: Settings = Depends(get_settings),
+):
+    """Server-Sent Events stream for text_to_sql questions only.
+
+    The frontend can call this endpoint to receive partial results as they
+    become available (SQL → rows → token-by-token explanation), which makes
+    long LLM responses feel responsive. Non-text_to_sql intents should keep
+    using /chat (this endpoint emits an `intent_mismatch` error for them so
+    the client can fall back).
+    """
+    policy = PolicyGuard().check(payload.message)
+    if policy.triggered:
+        async def _policy_stream():
+            yield _sse_event({"type": "intent_mismatch", "reason": "policy_blocked"})
+            yield _sse_event({"type": "token", "text": policy.answer})
+            yield _sse_event({"type": "done", "answer": policy.answer, "debug": {"pipeline": ["policy_guard"]}})
+        return StreamingResponse(_policy_stream(), media_type="text/event-stream")
+
+    resolved = _rewrite_follow_up(payload.session_id, payload.message)
+    if resolved and resolved != payload.message:
+        payload.message = resolved
+
+    llm = LLMClient(current_settings)
+    router = LLMIntentRouter(settings=current_settings, llm=llm)
+    decision = await router.route(payload.message)
+
+    # Only text_to_sql (and visualization which wraps it) benefit from streaming
+    # the explainer. Other intents return early so the client falls back to /chat.
+    if decision.intent not in {"text_to_sql", "visualization"}:
+        async def _mismatch():
+            yield _sse_event({"type": "intent_mismatch", "intent": decision.intent})
+        return StreamingResponse(_mismatch(), media_type="text/event-stream")
+
+    agent_plan = TaskPlanner(SESSION_STATE.get(payload.session_id)).plan(payload.message, decision=decision)
+    explicit_tickers = list(decision.tickers)
+    context_tickers = _resolve_context_tickers(payload.session_id, payload.message, decision.tickers)
+    if context_tickers:
+        decision.tickers = context_tickers
+    if len(agent_plan.tasks) == 1:
+        effective_message = agent_plan.tasks[0].message
+    else:
+        # Multi-task plans go through /chat (orchestrator is non-streaming).
+        async def _multi():
+            yield _sse_event({"type": "intent_mismatch", "reason": "multi_task"})
+        return StreamingResponse(_multi(), media_type="text/event-stream")
+
+    text_to_sql = TextToSQLService(db, current_settings, llm)
+
+    async def _generate():
+        # First event tells the client what we routed to.
+        yield _sse_event({
+            "type": "routing",
+            "intent": decision.intent,
+            "tickers": decision.tickers,
+            "reason": decision.reason,
+        })
+        try:
+            async for event in text_to_sql.stream_answer(effective_message):
+                yield _sse_event(event)
+                if event.get("type") == "done":
+                    # Track session state once the full answer is in.
+                    final_response = ChatResponse(
+                        intent="text_to_sql",
+                        answer=event.get("answer", ""),
+                        debug=event.get("debug") or {},
+                    )
+                    _remember_session_turn(payload.session_id, payload.message, final_response, decision)
+        except Exception as exc:
+            yield _sse_event({"type": "error", "message": str(exc)})
+
+    return StreamingResponse(_generate(), media_type="text/event-stream")
+
+
+def _sse_event(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 @app.post("/chat/route", response_model=RoutePreviewResponse)

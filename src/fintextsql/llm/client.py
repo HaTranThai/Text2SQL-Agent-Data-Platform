@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -101,3 +103,57 @@ class LLMClient:
             return str(data["choices"][0]["message"]["content"]).strip()
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"Unexpected LLM response shape: {data}") from exc
+
+    async def chat_stream(
+        self,
+        messages: list[LLMMessage],
+        *,
+        temperature: float = 0.1,
+        max_tokens: int = 1200,
+    ) -> AsyncIterator[str]:
+        """Stream chat completion content chunks (yields text fragments).
+
+        Uses OpenAI-compatible SSE: each chunk is `data: {json}\\n\\n`. Yields
+        only the incremental content text; terminator `data: [DONE]` is consumed
+        silently. The full response is never accumulated in memory.
+        """
+        if not self.settings.llm_api_key:
+            raise LLMError("LLM_API_KEY is not configured")
+        await self.ensure_alive()
+
+        payload: dict[str, Any] = {
+            "model": self.settings.llm_model,
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.settings.llm_api_key}",
+            "Accept": "text/event-stream",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                ) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            delta = chunk["choices"][0]["delta"].get("content") or ""
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
+                        if delta:
+                            yield delta
+        except httpx.HTTPError as exc:
+            self._health = (time.monotonic(), False, str(exc))
+            raise LLMError(f"LLM stream failed: {exc}") from exc

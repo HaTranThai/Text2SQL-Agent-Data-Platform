@@ -247,14 +247,27 @@ export default function App() {
     setInput("");
     setActiveProgress({ steps: progressStepsForMessage(text), current: 0 });
     setLoading(true);
+    let routedIntent: string | null = null;
     try {
       try {
         const route = await postJson<RoutePreviewResponse>("/chat/route", { message: text, session_id: sessionId });
         const steps = progressStepsForRoute(route);
         setActiveProgress({ steps, current: Math.min(1, steps.length - 1) });
+        routedIntent = route.intent;
       } catch {
         // The main chat request still owns the final answer if route preview fails.
       }
+
+      // Stream text_to_sql / visualization responses; fall back to /chat for
+      // other intents (general, web_search, ingestion) which don't benefit
+      // from token-by-token streaming the same way.
+      const shouldStream = routedIntent === "text_to_sql" || routedIntent === "visualization";
+      if (shouldStream) {
+        const streamed = await streamChat(text);
+        if (streamed) return;  // success: streamChat appended messages itself
+        // streamChat returned false → fall through to non-streaming /chat
+      }
+
       const response = await postJson<ChatResponse>("/chat", { message: text, session_id: sessionId });
       setMessages((current) => [...current, { role: "assistant", content: response.answer, response }]);
     } catch (error) {
@@ -266,6 +279,91 @@ export default function App() {
       setActiveProgress(null);
       setLoading(false);
     }
+  }
+
+  /**
+   * Consume the SSE stream from /chat/stream and append tokens to a growing
+   * assistant message. Returns true when the stream completes successfully
+   * (caller should NOT fall back to /chat); false on intent_mismatch so the
+   * caller can hit the regular /chat endpoint.
+   */
+  async function streamChat(text: string): Promise<boolean> {
+    const resp = await fetch(`${API_URL}/chat/stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text, session_id: sessionId }),
+    });
+    if (!resp.ok || !resp.body) return false;
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let messageIndex: number | null = null;
+    let partialAnswer = "";
+    let currentResponse: Partial<ChatResponse> = { intent: "text_to_sql", rows: [], columns: [], debug: {} };
+    let mismatched = false;
+
+    const pushOrUpdate = () => {
+      setMessages((current) => {
+        const next = [...current];
+        const msg: ChatMessage = {
+          role: "assistant",
+          content: partialAnswer,
+          response: { ...(currentResponse as ChatResponse), answer: partialAnswer } as ChatResponse,
+        };
+        if (messageIndex === null) {
+          messageIndex = next.length;
+          next.push(msg);
+        } else {
+          next[messageIndex] = msg;
+        }
+        return next;
+      });
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split("\n\n");
+      buffer = events.pop() ?? "";
+      for (const ev of events) {
+        if (!ev.startsWith("data:")) continue;
+        const raw = ev.slice(5).trim();
+        if (!raw) continue;
+        let payload: any;
+        try {
+          payload = JSON.parse(raw);
+        } catch {
+          continue;
+        }
+        if (payload.type === "intent_mismatch") {
+          mismatched = true;
+          break;
+        }
+        if (payload.type === "routing") {
+          currentResponse = { ...currentResponse, intent: payload.intent };
+        } else if (payload.type === "sql") {
+          currentResponse = { ...currentResponse, sql: payload.sql };
+          pushOrUpdate();
+        } else if (payload.type === "rows") {
+          currentResponse = { ...currentResponse, rows: payload.rows, columns: payload.columns };
+          pushOrUpdate();
+        } else if (payload.type === "token") {
+          partialAnswer += payload.text;
+          pushOrUpdate();
+        } else if (payload.type === "done") {
+          partialAnswer = payload.answer || partialAnswer;
+          currentResponse = { ...currentResponse, answer: partialAnswer, debug: payload.debug || {} };
+          pushOrUpdate();
+        } else if (payload.type === "error") {
+          partialAnswer = partialAnswer || `Lỗi: ${payload.message}`;
+          pushOrUpdate();
+        }
+      }
+      if (mismatched) break;
+    }
+    return !mismatched;
   }
 
   async function runIngestion(event: FormEvent) {

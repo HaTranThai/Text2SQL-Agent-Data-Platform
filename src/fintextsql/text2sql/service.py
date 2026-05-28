@@ -97,6 +97,99 @@ class TextToSQLService:
                 self.db.rollback()
         return result
 
+    async def stream_answer(self, question: str):
+        """Run the text-to-SQL pipeline and yield SSE-style events as work completes.
+
+        Events (each is a dict; the endpoint serializes to `data: {json}\\n\\n`):
+          {"type": "sql",    "sql": "..."}                    # after candidate gen
+          {"type": "rows",   "rows": [...], "columns": [...]} # after execute
+          {"type": "token",  "text": "..."}                   # explainer chunks
+          {"type": "done",   "debug": {...}, "answer": "..."} # final
+          {"type": "error",  "message": "..."}                # bail-out
+
+        This bypasses LangGraph because LangGraph can't yield mid-node; we
+        replicate the same node logic inline (build_sql + execute + repair
+        + explain) but emit events between steps. Behavior should match
+        answer() for the common path.
+        """
+        knowledge = extract_knowledge(question)
+        selected_schema = select_schema(question)
+        pipeline_trace: list[str] = [
+            "load_schema", "schema_cache", "knowledge_extractor", "schema_selector",
+        ]
+        try:
+            candidates = await self._generate_candidates(
+                question, selected_schema, plan="", knowledge=knowledge, count=1
+            )
+        except LLMError as exc:
+            yield {"type": "error", "message": f"LLM unavailable: {exc}"}
+            return
+        pipeline_trace.append("sql_generator")
+        sql = candidates[0]
+        yield {"type": "sql", "sql": sql}
+
+        try:
+            rows, columns, executed_sql = self._execute(sql)
+        except (SQLValidationError, SQLAlchemyError) as exc:
+            self.db.rollback()
+            # Single repair attempt: fan out to 3 diverse candidates.
+            try:
+                candidates = await self._generate_candidates(
+                    question, selected_schema, plan="", knowledge=knowledge, count=3
+                )
+            except LLMError as exc2:
+                yield {"type": "error", "message": f"SQL error + LLM repair failed: {exc2}"}
+                return
+            pipeline_trace.append("repair_agent_error_fan_out")
+            for candidate in candidates:
+                try:
+                    rows, columns, executed_sql = self._execute(candidate)
+                    sql = executed_sql
+                    yield {"type": "sql", "sql": sql}
+                    break
+                except (SQLValidationError, SQLAlchemyError):
+                    self.db.rollback()
+                    continue
+            else:
+                yield {"type": "error", "message": "All SQL candidates failed to execute"}
+                return
+        pipeline_trace.append("execute_sql")
+        yield {"type": "rows", "rows": rows, "columns": columns}
+
+        # Try the deterministic explainers first (instant, no LLM).
+        deterministic_answer = self._deterministic_only_explain(question, sql, rows)
+        if deterministic_answer:
+            pipeline_trace.append("explainer_deterministic")
+            yield {"type": "token", "text": deterministic_answer}
+            answer = deterministic_answer
+        else:
+            pipeline_trace.append("explainer_llm_stream")
+            answer_parts: list[str] = []
+            try:
+                async for chunk in self._explain_stream(question, sql, rows):
+                    answer_parts.append(chunk)
+                    yield {"type": "token", "text": chunk}
+                answer = _sanitize_answer("".join(answer_parts))
+            except LLMError as exc:
+                answer = _fallback_explanation(rows)
+                yield {"type": "token", "text": answer}
+
+        # Memorize successful Q→SQL for few-shot retrieval.
+        if sql and rows:
+            try:
+                record_example(self.db, question=question, sql=sql, intent="text_to_sql")
+            except Exception:
+                self.db.rollback()
+
+        yield {
+            "type": "done",
+            "answer": answer,
+            "debug": {
+                "selected_tables": selected_schema.tables,
+                "pipeline": pipeline_trace,
+            },
+        }
+
     def _build_graph(self):
         service = self
         max_rows = self.settings.max_sql_rows
@@ -588,6 +681,97 @@ class TextToSQLService:
             )
         except LLMError:
             return _fallback_explanation(rows)
+
+    def _deterministic_only_explain(
+        self, question: str, sql: str, rows: list[dict[str, Any]]
+    ) -> str | None:
+        """Run all deterministic Vietnamese formatters; return None if none match.
+
+        Used by stream_answer so we can skip the LLM explainer when a fast
+        template matches. Mirrors _explain's deterministic block.
+        """
+        if not rows:
+            nearest_dates = self._nearest_price_dates_for_exact_request(question)
+            no_rows = _deterministic_empty_result_explanation(question)
+            if no_rows:
+                if nearest_dates:
+                    return f"{no_rows}\n\n### Phiên gần nhất có trong dữ liệu\n{nearest_dates}"
+                return no_rows
+            volume_gap = self._missing_requested_year_explanation(question)
+            if volume_gap:
+                return volume_gap
+            return None
+        for fn in (
+            _deterministic_exact_ohlc_explanation,
+            _deterministic_month_price_data_explanation,
+            _deterministic_month_close_explanation,
+            _deterministic_aggregate_explanation,
+            _deterministic_up_sessions_explanation,
+            _deterministic_streak_explanation,
+            _deterministic_ma_explanation,
+            _deterministic_recovery_explanation,
+            _deterministic_correlation_explanation,
+            _deterministic_year_vs_year_return_explanation,
+            _deterministic_year_return_explanation,
+            _deterministic_drawdown_explanation,
+            _deterministic_volume_date_vs_quarter_max_explanation,
+            _deterministic_top_volume_explanation,
+            _deterministic_latest_volume_explanation,
+            _deterministic_lowest_volume_explanation,
+            _deterministic_return_volatility_explanation,
+            _deterministic_growth_stability_explanation,
+            _deterministic_outperform_spy_lower_volatility_explanation,
+            _deterministic_latest_close_explanation,
+            _deterministic_monthly_high_close_explanation,
+            _deterministic_high_close_explanation,
+            _deterministic_quarterly_close_explanation,
+            _deterministic_price_comparison_explanation,
+            _deterministic_market_cap_explanation,
+        ):
+            result = fn(question, rows)
+            if result:
+                return result
+        return None
+
+    async def _explain_stream(
+        self, question: str, sql: str, rows: list[dict[str, Any]]
+    ):
+        """Stream the LLM explainer's tokens. Used by stream_answer when no
+        deterministic formatter matched.
+        """
+        rows_for_explanation = _rows_for_explanation(rows)
+        profile = _result_profile(rows)
+        async for chunk in self.llm.chat_stream(
+            [
+                LLMMessage(
+                    "system",
+                    "\n".join(
+                        [
+                            "You explain SQL results for finance users in Vietnamese.",
+                            "Be concise and numerically careful.",
+                            "Never infer the full date range from only the first rows.",
+                            "Use the provided result profile for row count and min/max dates.",
+                            "If rows_for_explanation is marked incomplete, say it is a preview and avoid claiming it contains all rows.",
+                            "Do not say the query failed when SQL returned rows.",
+                        ]
+                    ),
+                ),
+                LLMMessage(
+                    "user",
+                    "\n\n".join(
+                        [
+                            f"Question:\n{question}",
+                            f"SQL:\n{sql}",
+                            f"Result profile:\n{profile}",
+                            f"Rows for explanation:\n{rows_for_explanation}",
+                        ]
+                    ),
+                ),
+            ],
+            temperature=0.2,
+            max_tokens=600,
+        ):
+            yield chunk
 
     def _nearest_price_dates_for_exact_request(self, question: str) -> str | None:
         exact_date = _requested_exact_date(question)
