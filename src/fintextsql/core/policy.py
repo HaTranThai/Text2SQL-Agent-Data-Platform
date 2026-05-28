@@ -98,13 +98,6 @@ class PolicyGuard:
                 "Mình không có mô hình dự báo giá tương lai nên không thể đưa ra một mức giá tháng sau. Mình có thể phân tích xu hướng lịch sử, MA/EMA, volatility và các kịch bản thận trọng nếu bạn muốn đánh giá rủi ro.",
             )
 
-        if _contains_any(text, ["ceo", "giam doc dieu hanh"]):
-            return PolicyDecision(
-                True,
-                "unsupported_fundamental",
-                "Schema hiện tại không có dữ liệu CEO/ban lãnh đạo, nên mình không thể trả lời câu này từ database. Mình chỉ nên truy vấn các dữ liệu đang có như giá, volume, fundamentals, beta, P/E và tin tức đã ingest.",
-            )
-
         if _contains_any(text, ["co phieu nao tot nhat", "co phieu tot nhat hien tai", "co phieu nao tot nhat hien tai"]):
             return PolicyDecision(
                 True,

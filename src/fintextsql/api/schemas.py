@@ -4,7 +4,15 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-IntentName = Literal["general", "text_to_sql", "visualization", "news", "ingestion", "simple_finance"]
+IntentName = Literal[
+    "general",
+    "text_to_sql",
+    "visualization",
+    "news",
+    "ingestion",
+    "simple_finance",
+    "company_info",
+]
 
 
 class ChatRequest(BaseModel):
