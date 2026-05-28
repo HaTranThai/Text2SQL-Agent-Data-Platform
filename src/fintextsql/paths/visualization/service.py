@@ -7,6 +7,15 @@ from fintextsql.api.schemas import VisualizationSpec
 from fintextsql.text2sql.service import TextToSQLResult, TextToSQLService
 
 DEFAULT_NUMERIC_COLUMNS = [
+    # Return / volatility metrics — if the SQL bothered to compute these,
+    # they are always the answer; pick them over raw price columns.
+    "period_return_pct",
+    "return_pct",
+    "annual_return_pct",
+    "ytd_return_pct",
+    "daily_volatility_pct",
+    "return_volatility_ratio",
+    "pct_change",
     "close",
     "adj_close",
     "last_price",
@@ -21,6 +30,20 @@ DEFAULT_NUMERIC_COLUMNS = [
     "day_low",
     "rows_loaded",
 ]
+
+# Columns that look numeric but represent a dimension/identifier — never use as Y.
+DIMENSION_COLUMNS = {
+    "id",
+    "company_id",
+    "year",
+    "month",
+    "quarter",
+    "week",
+    "day",
+    "rn_asc",
+    "rn_desc",
+    "return_observations",
+}
 
 
 class VisualizationService:
@@ -45,7 +68,7 @@ def infer_visualization(
     if y and not _column_has_number(rows, y):
         y = None
     if not y:
-        y = _first_numeric_column(rows, columns, exclude={"id", "company_id"})
+        y = _first_numeric_column(rows, columns, exclude=DIMENSION_COLUMNS)
     x = _choose_x_column(question_l, columns, y)
     if not x:
         return None
@@ -54,6 +77,13 @@ def infer_visualization(
 
     if "ticker" in columns and (_is_cross_sectional_metric(y) or "top" in question_l):
         x = "ticker"
+
+    # Year/period dimension takes priority over ticker for X when present
+    # (e.g. compare returns across years: x=year, y=return_pct, series=ticker).
+    for period_col in ("year", "month", "quarter"):
+        if period_col in columns and x == "ticker" and y != period_col:
+            x = period_col
+            break
 
     # Multi-metric time series for a single ticker (e.g. close + MA20 + MA50): plot every
     # price-family column as its own line instead of collapsing to a single close line.
@@ -74,6 +104,8 @@ def infer_visualization(
     series = "ticker" if "ticker" in columns and x != "ticker" else None
     chart_type = "line"
     if any(word in question_l for word in ["bar", "cột"]) or x == "ticker":
+        chart_type = "bar"
+    if x in {"year", "month", "quarter"}:
         chart_type = "bar"
     if "top" in question_l and x != "date":
         chart_type = "bar"
@@ -97,6 +129,24 @@ def _price_family_columns(
 
 
 def _preferred_y_columns(question_l: str) -> list[str]:
+    # Growth / return / volatility comparisons — prefer the rate column over price.
+    if any(
+        word in question_l
+        for word in [
+            "return", "tăng trưởng", "tang truong", "growth",
+            "tốc độ tăng", "toc do tang", "lợi nhuận", "loi nhuan",
+            "% tăng", "% tang", "ổn định", "on dinh", "volatility", "biến động",
+        ]
+    ):
+        return [
+            "period_return_pct",
+            "return_pct",
+            "annual_return_pct",
+            "ytd_return_pct",
+            "daily_volatility_pct",
+            "return_volatility_ratio",
+            *DEFAULT_NUMERIC_COLUMNS,
+        ]
     if any(word in question_l for word in ["market cap", "vốn hóa", "von hoa"]):
         return ["market_cap", *DEFAULT_NUMERIC_COLUMNS]
     if any(word in question_l for word in ["volume", "khối lượng", "khoi luong"]):
