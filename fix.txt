@@ -1,9 +1,0 @@
-# FinTextSQL fix verification report
-
-- Checked previous failing cases: 10
-- OK: 10
-- Needs fix / inspect: 0
-
-Các câu đã được liệt kê trong `fix.txt` trước đó đều đã qua targeted verification sau khi vá.
-
-Lưu ý: lần full benchmark trước đó còn 10 fail; targeted rerun 10 câu đó hiện pass theo rule kiểm tra.
