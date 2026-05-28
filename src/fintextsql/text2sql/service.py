@@ -463,6 +463,9 @@ class TextToSQLService:
         deterministic_risk_adjusted = _deterministic_return_volatility_explanation(question, rows)
         if deterministic_risk_adjusted:
             return deterministic_risk_adjusted
+        deterministic_growth_stability = _deterministic_growth_stability_explanation(question, rows)
+        if deterministic_growth_stability:
+            return deterministic_growth_stability
         deterministic_outperform_spy = _deterministic_outperform_spy_lower_volatility_explanation(question, rows)
         if deterministic_outperform_spy:
             return deterministic_outperform_spy
@@ -733,10 +736,12 @@ def _deterministic_sql(question: str, max_limit: int) -> str | None:
         or _recovery_after_biggest_drop_sql(question, max_limit)
         or _volume_price_correlation_sql(question, max_limit)
         or _month_price_data_sql(question, max_limit)
+        or _all_tickers_month_close_sql(question, max_limit)
         or _month_close_sql(question, max_limit)
-        or _latest_close_sql(question, max_limit)
+        or _growth_stability_ranking_sql(question, max_limit)
         or _outperform_spy_lower_volatility_sql(question, max_limit)
         or _return_volatility_sql(question, max_limit)
+        or _latest_close_sql(question, max_limit)
         or _price_change_sql(question, max_limit)
         or _quarterly_close_comparison_sql(question, max_limit)
         or _monthly_high_close_sql(question, max_limit)
@@ -1369,6 +1374,22 @@ def _month_close_sql(question: str, max_limit: int) -> str | None:
     )
 
 
+def _all_tickers_month_close_sql(question: str, max_limit: int) -> str | None:
+    """All tickers, single month — e.g. 'giá close của tất cả các mã trong db trong 5/2026'."""
+    month_window = _requested_month_window(question)
+    if not month_window or not _asks_for_all_tickers(question) or not _asks_for_month_close(question):
+        return None
+    if _should_defer_to_llm(question):
+        return None
+    start_date, end_date = month_window
+    return (
+        "SELECT c.ticker, c.name, p.date, p.close "
+        "FROM companies c JOIN prices p ON p.company_id = c.id "
+        f"WHERE p.date >= DATE '{start_date}' AND p.date < DATE '{end_date}' "
+        f"ORDER BY c.ticker ASC, p.date ASC LIMIT {max_limit}"
+    )
+
+
 def _latest_close_sql(question: str, max_limit: int) -> str | None:
     tickers = _context_tickers(question) or extract_tickers(question)
     question_l = question.lower()
@@ -1494,6 +1515,54 @@ def _outperform_spy_lower_volatility_sql(question: str, max_limit: int) -> str |
         " FROM scored s CROSS JOIN spy"
         " WHERE s.ticker <> 'SPY' AND s.period_return > spy.spy_return AND s.daily_volatility < spy.spy_daily_volatility"
         f" ORDER BY s.period_return DESC NULLS LAST, s.daily_volatility ASC LIMIT {limit}"
+    )
+
+
+def _growth_stability_ranking_sql(question: str, max_limit: int) -> str | None:
+    """Rank tickers by growth (period return) AND stability (low daily-return stddev).
+
+    Triggers when the question asks for fastest-growing / most stable combo,
+    e.g. "tốc độ tăng nhanh và ổn định nhất", "tăng đều và ổn định".
+    """
+    if not _asks_for_growth_stability(question):
+        return None
+    tickers = _context_tickers(question) or extract_tickers(question)
+    if not tickers or len(tickers) < 2:
+        return None
+    days = _requested_window_days(question) or 30
+    ticker_filter = _ticker_condition(tickers, "c.ticker")
+    if not ticker_filter:
+        return None
+    limit = min(max(len(tickers), 1), max_limit)
+    return (
+        "WITH daily_prices AS ("
+        " SELECT c.ticker, c.name, p.date, p.close,"
+        " LAG(p.close) OVER (PARTITION BY c.ticker ORDER BY p.date ASC) AS prev_close,"
+        " ROW_NUMBER() OVER (PARTITION BY c.ticker ORDER BY p.date ASC) AS rn_asc,"
+        " ROW_NUMBER() OVER (PARTITION BY c.ticker ORDER BY p.date DESC) AS rn_desc"
+        " FROM companies c JOIN prices p ON p.company_id = c.id"
+        f" WHERE {ticker_filter} AND p.date >= CURRENT_DATE - INTERVAL '{days} days' AND p.close IS NOT NULL"
+        "), daily_returns AS ("
+        " SELECT ticker, name, date, close, rn_asc, rn_desc,"
+        " CASE WHEN prev_close IS NOT NULL AND prev_close <> 0 THEN (close - prev_close) / prev_close END AS daily_return"
+        " FROM daily_prices"
+        "), metrics AS ("
+        " SELECT ticker, name,"
+        " MAX(CASE WHEN rn_asc = 1 THEN date END) AS start_date,"
+        " MAX(CASE WHEN rn_asc = 1 THEN close END) AS start_close,"
+        " MAX(CASE WHEN rn_desc = 1 THEN date END) AS end_date,"
+        " MAX(CASE WHEN rn_desc = 1 THEN close END) AS end_close,"
+        " STDDEV_SAMP(daily_return) AS daily_volatility,"
+        " COUNT(daily_return) AS return_observations"
+        " FROM daily_returns GROUP BY ticker, name"
+        ") SELECT ticker, name, start_date, start_close, end_date, end_close,"
+        " ROUND((((end_close - start_close) / NULLIF(start_close, 0)) * 100)::numeric, 2)::float AS period_return_pct,"
+        " ROUND((daily_volatility * 100)::numeric, 4)::float AS daily_volatility_pct,"
+        " ROUND(((((end_close - start_close) / NULLIF(start_close, 0)) / NULLIF(daily_volatility, 0)))::numeric, 4)::float AS return_volatility_ratio,"
+        " return_observations"
+        " FROM metrics"
+        " WHERE start_close IS NOT NULL AND end_close IS NOT NULL"
+        f" ORDER BY return_volatility_ratio DESC NULLS LAST LIMIT {limit}"
     )
 
 
@@ -1758,6 +1827,20 @@ def _asks_for_month_close(question: str) -> bool:
     return has_close and _requested_month_window(question) is not None
 
 
+def _asks_for_all_tickers(question: str) -> bool:
+    """Detect 'all tickers / everything in DB' scope (no specific ticker filter)."""
+    normalized = _normalize_text(question.lower())
+    return any(
+        phrase in normalized
+        for phrase in [
+            "tat ca cac ma", "tat ca ma", "toan bo cac ma", "toan bo ma",
+            "moi ma", "tat ca du lieu",
+            "all tickers", "all stocks", "all symbols", "every ticker",
+            "trong db", "trong database", "in the db", "in db",
+        ]
+    )
+
+
 def _asks_for_avg_close(question: str) -> bool:
     normalized = _normalize_text(question.lower())
     has_avg = any(phrase in normalized for phrase in ["trung binh", "average", "avg"])
@@ -1771,6 +1854,31 @@ def _asks_for_return_volatility(question: str) -> bool:
     has_risk = any(phrase in normalized for phrase in ["volatility", "bien dong", "rui ro"])
     has_ratio = any(phrase in normalized for phrase in ["ty le", "ti le", "ratio", "/volatility", "return/volatility"])
     return has_return and has_risk and has_ratio
+
+
+def _asks_for_growth_stability(question: str) -> bool:
+    """Detect requests for "fastest-growing AND most stable" type rankings.
+
+    Examples:
+      - "trong 3 cái đó thì cái nào có tốc độ tăng nhanh và ổn định nhất"
+      - "mã nào tăng đều và ổn định nhất"
+      - "growth fastest and most stable"
+    """
+    normalized = _normalize_text(question.lower())
+    growth_terms = [
+        "toc do tang", "tang nhanh", "tang truong nhanh", "tang manh",
+        "tang deu", "tang on dinh", "growth fastest", "fastest growth",
+        "fastest growing", "growth rate", "loi nhuan cao",
+    ]
+    stability_terms = [
+        "on dinh", "stable", "stability", "deu nhat", "deu dan", "it bien dong",
+        "low volatility", "least volatile", "low variance",
+    ]
+    has_growth = any(term in normalized for term in growth_terms)
+    has_stability = any(term in normalized for term in stability_terms)
+    # Either both signals present, OR an explicit ranking word + one strong signal.
+    has_ranking = any(term in normalized for term in ["nhat", "best", "top", "cao nhat", "tot nhat"])
+    return has_growth and has_stability and has_ranking
 
 
 def _asks_for_outperform_spy_lower_volatility(question: str) -> bool:
@@ -1931,16 +2039,27 @@ def _requested_top_count(question: str) -> int | None:
 def _requested_month_window(question: str) -> tuple[str, str] | None:
     question = _latest_user_question(question)
     normalized = _normalize_text(question.lower())
+    # "thang 5 nam 2026" / "thang 5 2026"
     match = re.search(r"\bthang\s+(\d{1,2})(?:\s+nam)?\s+(20\d{2})\b", normalized)
-    if not match:
-        match = re.search(r"\b(20\d{2})-(\d{1,2})\b", normalized)
-        if not match:
-            return None
-        year = int(match.group(1))
-        month = int(match.group(2))
+    if match:
+        month, year = int(match.group(1)), int(match.group(2))
     else:
-        month = int(match.group(1))
-        year = int(match.group(2))
+        # "t5/2026" or "t5-2026"
+        match = re.search(r"\bt(\d{1,2})[/\-](20\d{2})\b", normalized)
+        if match:
+            month, year = int(match.group(1)), int(match.group(2))
+        else:
+            # "5/2026" or "05-2026" — month/year. Restrict month to 1-12 to avoid
+            # confusing day/month (12/2026 is unambiguous as Dec 2026).
+            match = re.search(r"(?<!\d)(\d{1,2})[/\-](20\d{2})\b", normalized)
+            if match:
+                month, year = int(match.group(1)), int(match.group(2))
+            else:
+                # "2026-05" / "2026/5"
+                match = re.search(r"\b(20\d{2})[/\-](\d{1,2})\b", normalized)
+                if not match:
+                    return None
+                year, month = int(match.group(1)), int(match.group(2))
     if month < 1 or month > 12:
         return None
     start = date(year, month, 1)
@@ -2494,6 +2613,70 @@ def _deterministic_return_volatility_explanation(question: str, rows: list[dict[
             "### Kết luận",
             f"- Mã có tỷ lệ return/volatility tốt nhất trong nhóm là {leader['ticker']} với ratio {_format_number(float(leader['return_volatility_ratio']))}.",
             "- Ratio này dùng return cả kỳ chia cho độ lệch chuẩn lợi suất ngày; đây là thước đo lịch sử, không phải khuyến nghị mua bán.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _deterministic_growth_stability_explanation(question: str, rows: list[dict[str, Any]]) -> str | None:
+    """Explain growth+stability ranking, picking the best by composite rank."""
+    if not rows or not _asks_for_growth_stability(question):
+        return None
+    required = {"ticker", "period_return_pct", "daily_volatility_pct"}
+    if not required.issubset(rows[0]):
+        return None
+    usable = [
+        row
+        for row in rows
+        if row.get("ticker")
+        and _is_number(row.get("period_return_pct"))
+        and _is_number(row.get("daily_volatility_pct"))
+    ]
+    if not usable:
+        return None
+
+    # Rank by growth (descending) and stability (ascending volatility) separately,
+    # then take the ticker with the best sum of ranks. This is more interpretable
+    # than the raw return/volatility ratio when one ticker has near-zero volatility.
+    by_growth = sorted(usable, key=lambda r: float(r["period_return_pct"]), reverse=True)
+    growth_rank = {row["ticker"]: idx for idx, row in enumerate(by_growth)}
+    by_stability = sorted(usable, key=lambda r: float(r["daily_volatility_pct"]))
+    stability_rank = {row["ticker"]: idx for idx, row in enumerate(by_stability)}
+
+    composite = [
+        (row, growth_rank[row["ticker"]] + stability_rank[row["ticker"]])
+        for row in usable
+    ]
+    composite.sort(key=lambda pair: (pair[1], -float(pair[0]["period_return_pct"])))
+    leader = composite[0][0]
+    growth_leader = by_growth[0]
+    stability_leader = by_stability[0]
+
+    start_dates = [str(row.get("start_date"))[:10] for row in usable if row.get("start_date")]
+    end_dates = [str(row.get("end_date"))[:10] for row in usable if row.get("end_date")]
+    range_text = f", từ {min(start_dates)} đến {max(end_dates)}" if start_dates and end_dates else ""
+
+    lines = [
+        f"Đã xếp hạng theo tốc độ tăng và độ ổn định{return_window_suffix(question)}{range_text}.",
+        "",
+        "### Kết quả",
+    ]
+    for row in sorted(usable, key=lambda r: float(r["period_return_pct"]), reverse=True):
+        lines.append(
+            "- {ticker}: tăng {ret}, độ biến động hàng ngày {vol} (lệch chuẩn lợi suất ngày).".format(
+                ticker=row["ticker"],
+                ret=_format_percent(float(row["period_return_pct"])),
+                vol=_format_percent(float(row["daily_volatility_pct"])),
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "### Kết luận",
+            f"- Mã tăng nhanh nhất: **{growth_leader['ticker']}** ({_format_percent(float(growth_leader['period_return_pct']))}).",
+            f"- Mã ổn định nhất (biến động thấp nhất): **{stability_leader['ticker']}** ({_format_percent(float(stability_leader['daily_volatility_pct']))} / ngày).",
+            f"- Cân bằng cả hai tiêu chí, **{leader['ticker']}** là mã có tốc độ tăng nhanh và ổn định nhất trong nhóm.",
+            "- Đây là phân tích lịch sử, không phải khuyến nghị đầu tư.",
         ]
     )
     return "\n".join(lines)

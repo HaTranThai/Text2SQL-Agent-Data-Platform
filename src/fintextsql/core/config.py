@@ -17,7 +17,9 @@ class Settings(BaseSettings):
         default="http://localhost:5173,http://127.0.0.1:5173",
         validation_alias="CORS_ORIGINS",
     )
-    max_sql_rows: int = Field(default=2000, validation_alias="MAX_SQL_ROWS")
+    max_sql_rows: int = Field(default=5000, validation_alias="MAX_SQL_ROWS")
+    tavily_api_key: str = Field(default="", validation_alias="TAVILY_API_KEY")
+    tavily_timeout_seconds: int = Field(default=15, validation_alias="TAVILY_TIMEOUT_SECONDS")
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
