@@ -18,6 +18,7 @@ from fintextsql.api.schemas import (
     HealthResponse,
     IngestionRequest,
     IngestionResponse,
+    MemoryExampleResponse,
     RoutePreviewResponse,
     TaskResult,
     VisualizationSpec,
@@ -27,7 +28,7 @@ from fintextsql.core.intent import IntentRouter, RouteDecision
 from fintextsql.core.policy import PolicyDecision, PolicyGuard
 from fintextsql.core.planner import AgentPlan, PlannedTask, TaskPlanner
 from fintextsql.core.tickers import extract_tickers
-from fintextsql.db.models import Company
+from fintextsql.db.models import Company, QAExample
 from fintextsql.db.session import get_db, init_db
 from fintextsql.ingestion.yfinance_service import YFinanceIngestionService
 from fintextsql.llm.client import LLMClient
@@ -67,6 +68,43 @@ def health() -> HealthResponse:
 @app.get("/schema")
 def schema() -> dict[str, str]:
     return {"schema": full_schema_text()}
+
+
+@app.get("/memory", response_model=list[MemoryExampleResponse])
+def memory_list(limit: int = 100, db: Session = Depends(get_db)) -> list[MemoryExampleResponse]:
+    rows = (
+        db.execute(select(QAExample).order_by(QAExample.created_at.desc()).limit(max(1, min(limit, 500))))
+        .scalars()
+        .all()
+    )
+    return [
+        MemoryExampleResponse(
+            id=row.id,
+            question=row.question,
+            sql=row.sql,
+            intent=row.intent,
+            use_count=row.use_count,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+
+
+@app.delete("/memory/{example_id}")
+def memory_delete(example_id: int, db: Session = Depends(get_db)) -> dict[str, bool]:
+    row = db.get(QAExample, example_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="memory example not found")
+    db.delete(row)
+    db.commit()
+    return {"deleted": True}
+
+
+@app.delete("/memory")
+def memory_clear(db: Session = Depends(get_db)) -> dict[str, int]:
+    deleted = db.query(QAExample).delete()
+    db.commit()
+    return {"deleted": int(deleted)}
 
 
 @app.get("/companies", response_model=list[CompanyResponse])

@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   BarChart3,
   Bot,
+  Brain,
   ChevronDown,
   Database,
   Loader2,
@@ -15,7 +16,9 @@ import {
   Sun,
   Table2,
   TerminalSquare,
+  Trash2,
   User,
+  X,
 } from "lucide-react";
 import {
   Area,
@@ -99,6 +102,15 @@ type ChatMessage = {
   response?: ChatResponse;
 };
 
+type MemoryExample = {
+  id: number;
+  question: string;
+  sql: string;
+  intent: string | null;
+  use_count: number;
+  created_at: string;
+};
+
 type ProgressStep = {
   key: string;
   label: string;
@@ -139,7 +151,32 @@ export default function App() {
   const [companies, setCompanies] = useState<Company[]>([]);
   const [health, setHealth] = useState<"checking" | "ok" | "down">("checking");
   const [theme, setTheme] = useState<"light" | "dark">(() => readStoredTheme());
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [memoryItems, setMemoryItems] = useState<MemoryExample[]>([]);
+  const [memoryLoading, setMemoryLoading] = useState(false);
   const conversationRef = useRef<HTMLDivElement | null>(null);
+
+  async function openMemory() {
+    setMemoryOpen(true);
+    setMemoryLoading(true);
+    try {
+      const response = await fetch(`${API_URL}/memory?limit=200`);
+      if (response.ok) setMemoryItems(await response.json());
+    } finally {
+      setMemoryLoading(false);
+    }
+  }
+
+  async function deleteMemoryItem(id: number) {
+    await fetch(`${API_URL}/memory/${id}`, { method: "DELETE" });
+    setMemoryItems((previous) => previous.filter((item) => item.id !== id));
+  }
+
+  async function clearMemory() {
+    if (!window.confirm("Xoá toàn bộ bộ nhớ Q→SQL? Hành động không hoàn tác.")) return;
+    await fetch(`${API_URL}/memory`, { method: "DELETE" });
+    setMemoryItems([]);
+  }
 
   const loadedTickers = useMemo(() => new Set(companies.map((company) => company.ticker)), [companies]);
 
@@ -305,6 +342,11 @@ export default function App() {
           Cuộc trò chuyện mới
         </button>
 
+        <button type="button" className="sidebar-action" onClick={openMemory}>
+          <Brain size={15} aria-hidden="true" />
+          Bộ nhớ Q→SQL
+        </button>
+
         <div className="sidebar-section">
           <div className="sidebar-section-title">Dữ liệu</div>
           <form className="data-panel" onSubmit={runIngestion}>
@@ -425,6 +467,60 @@ export default function App() {
           </button>
         </form>
       </main>
+
+      {memoryOpen ? (
+        <div className="modal-backdrop" onClick={() => setMemoryOpen(false)}>
+          <div className="modal-panel" onClick={(event) => event.stopPropagation()}>
+            <header className="modal-header">
+              <div className="modal-title">
+                <Brain size={16} aria-hidden="true" />
+                <span>Bộ nhớ Q→SQL ({memoryItems.length})</span>
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="modal-clear" onClick={clearMemory} disabled={!memoryItems.length}>
+                  <Trash2 size={14} aria-hidden="true" />
+                  Xoá tất cả
+                </button>
+                <button type="button" className="modal-close" onClick={() => setMemoryOpen(false)} aria-label="Đóng">
+                  <X size={16} aria-hidden="true" />
+                </button>
+              </div>
+            </header>
+            <div className="modal-body">
+              {memoryLoading ? (
+                <div className="memory-empty">Đang tải…</div>
+              ) : memoryItems.length === 0 ? (
+                <div className="memory-empty">
+                  Chưa có gì được nhớ. Mỗi câu hỏi trả lời đúng sẽ được lưu lại để gợi ý cho LLM lần sau.
+                </div>
+              ) : (
+                memoryItems.map((item) => (
+                  <article key={item.id} className="memory-item">
+                    <div className="memory-item-head">
+                      <div className="memory-item-meta">
+                        <span className="memory-pill">#{item.id}</span>
+                        {item.intent ? <span className="memory-pill">{item.intent}</span> : null}
+                        <span className="memory-pill muted">dùng {item.use_count} lần</span>
+                        <span className="memory-date">{new Date(item.created_at).toLocaleString("vi-VN")}</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="memory-delete"
+                        onClick={() => deleteMemoryItem(item.id)}
+                        title="Xoá khỏi bộ nhớ"
+                      >
+                        <Trash2 size={14} aria-hidden="true" />
+                      </button>
+                    </div>
+                    <div className="memory-question">{item.question}</div>
+                    <pre className="memory-sql">{formatSql(item.sql)}</pre>
+                  </article>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

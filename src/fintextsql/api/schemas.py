@@ -80,3 +80,12 @@ class CompanyResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     timestamp: datetime
+
+
+class MemoryExampleResponse(BaseModel):
+    id: int
+    question: str
+    sql: str
+    intent: str | None = None
+    use_count: int = 0
+    created_at: datetime
