@@ -996,7 +996,13 @@ def _extract_window_phrase(text: str) -> str:
         unit = {"ngay": "ngày", "thang": "tháng", "nam": "năm", "phien": "phiên"}[match.group(2)]
         return f"{match.group(1)} {unit} gần nhất"
     # Loose fallback: a bare "N ngày/tháng/năm/phiên" -> treat as a recent window.
-    match = re.search(r"(\d{1,4})\s*(ngay|thang|nam|phien)\b", ascii_text)
+    # Loose fallback: a bare "N ngày/tháng/năm/phiên" -> recent window.
+    # The negative lookahead skips multi-period back-references like "2 năm này/đó/trên",
+    # which refer to PRIOR turns rather than a current relative window.
+    match = re.search(
+        r"(\d{1,4})\s*(ngay|thang|nam|phien)(?!\s+(?:nay|do|tren))\b",
+        ascii_text,
+    )
     if match:
         unit = {"ngay": "ngày", "thang": "tháng", "nam": "năm", "phien": "phiên"}[match.group(2)]
         return f"{match.group(1)} {unit} gần nhất"
@@ -1087,8 +1093,10 @@ def _rewrite_follow_up(session_id: str | None, message: str) -> str | None:
         or "cac nam" in text or "nhung nam" in text or "ca hai nam" in text
     )
 
-    # Case E: multi-period growth/return comparison referring back across several turns.
-    if is_multi_period and has_metric and not new_tickers:
+    # Case E: multi-period reference ("X năm này / các năm này / cả 2 năm").
+    # Reuse the explicit calendar years from prior turns (T1, T2, ...) and, if the
+    # follow-up also names new tickers, merge them with the prior tickers.
+    if is_multi_period:
         history = SESSION_HISTORY.get(session_id, [])
         prior_years: list[int] = []
         for turn in history[-6:]:
@@ -1097,8 +1105,9 @@ def _rewrite_follow_up(session_id: str | None, message: str) -> str | None:
                 if year_val not in prior_years:
                     prior_years.append(year_val)
         if len(prior_years) >= 2:
+            target = _merge_tickers(old_tickers, new_tickers) if new_tickers else old_tickers
             years_phrase = " và ".join(f"năm {y}" for y in sorted(prior_years)[:3])
-            return f"{message} của {', '.join(old_tickers)} giữa {years_phrase}"
+            return f"{message} của {', '.join(target)} giữa {years_phrase}"
 
     if not (is_compare or is_continuation or is_pronoun or is_window_swap):
         return None

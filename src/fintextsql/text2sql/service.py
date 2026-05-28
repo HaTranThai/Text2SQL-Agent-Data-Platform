@@ -1104,7 +1104,10 @@ def _year_vs_year_return_sql(question: str, max_limit: int) -> str | None:
         return None
     if not any(
         phrase in normalized
-        for phrase in ["tang truong", "growth", "loi suat", "return", "phan tram", "%", "tang", "giam"]
+        for phrase in [
+            "tang truong", "growth", "loi suat", "return", "phan tram", "%",
+            "tang", "giam", "cao hon", "thap hon", "so sanh", "compare", "nao cao", "nao tot",
+        ]
     ):
         return None
     ticker_filter = _ticker_condition(tickers, "c.ticker")
