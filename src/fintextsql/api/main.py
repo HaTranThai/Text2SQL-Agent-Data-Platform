@@ -33,6 +33,7 @@ from fintextsql.db.session import get_db, init_db
 from fintextsql.ingestion.yfinance_service import YFinanceIngestionService
 from fintextsql.llm.client import LLMClient
 from fintextsql.paths.news.service import NewsService
+from fintextsql.paths.company_info.service import CompanyInfoService
 from fintextsql.paths.simple_finance.service import SimpleFinanceService
 from fintextsql.paths.visualization.service import VisualizationService, infer_visualization
 from fintextsql.text2sql.schema import full_schema_text
@@ -264,6 +265,26 @@ async def chat(
             _remember_session_turn(payload.session_id, payload.message, response, decision)
             return response
 
+        if decision.intent == "company_info":
+            answer, sources = await CompanyInfoService(settings, llm).answer(payload.message, decision.tickers)
+            response = ChatResponse(
+                intent="company_info",
+                answer=answer,
+                rows=sources,
+                columns=list(sources[0].keys()) if sources else [],
+                sources=sources,
+                debug={
+                    "router": asdict(decision),
+                    "pipeline": ["tavily_search", "llm_summarize"],
+                    "planner": agent_plan.to_debug(),
+                    "task_count": len(agent_plan.tasks),
+                    "context_used": agent_plan.context_used,
+                    "resolved_state": agent_plan.resolved_state,
+                },
+            )
+            _remember_session_turn(payload.session_id, payload.message, response, decision)
+            return response
+
         if decision.intent == "simple_finance":
             answer, rows = await SimpleFinanceService(db).answer(payload.message, decision.tickers)
             columns = list(rows[0].keys()) if rows else []
@@ -410,6 +431,16 @@ async def _execute_planned_task(
             columns=list(sources[0].keys()) if sources else [],
             debug={"pipeline": ["load_news", "analyze_news", "format_sources"], "task": asdict(task)},
         )
+    if task.intent == "company_info":
+        answer, sources = await CompanyInfoService(settings, llm).answer(task.message, task.tickers)
+        return TaskResult(
+            intent="company_info",
+            title=task.title,
+            answer=answer,
+            rows=sources,
+            columns=list(sources[0].keys()) if sources else [],
+            debug={"pipeline": ["tavily_search", "llm_summarize"], "task": asdict(task)},
+        )
     text_to_sql = TextToSQLService(db, settings, llm)
     if task.intent == "visualization":
         result, viz = await VisualizationService(text_to_sql).answer(task.message)
@@ -500,6 +531,8 @@ def _preview_pipeline(intent: str) -> list[str]:
         return ["parse_ingestion_request", "fetch_yfinance", "upsert_postgres"]
     if intent == "news":
         return ["load_news", "analyze_news", "format_sources"]
+    if intent == "company_info":
+        return ["tavily_search", "llm_summarize"]
     if intent == "simple_finance":
         return ["quote_lookup", "fallback_postgres_if_needed", "infer_visualization"]
     if intent == "visualization":
