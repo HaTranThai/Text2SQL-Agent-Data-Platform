@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -18,10 +20,48 @@ class LLMMessage:
     content: str
 
 
+# How long to remember a recent health-check result so we don't probe on every request.
+_HEALTH_TTL_SECONDS = 5.0
+# Short timeout for the pre-flight probe (TCP connect + tiny GET). Must be far below
+# the chat timeout so a dead endpoint fails fast (~3s) instead of hanging the full 60s.
+_HEALTH_PROBE_TIMEOUT = 3.0
+
+
 class LLMClient:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.base_url = settings.llm_base_url.rstrip("/")
+        self._health: tuple[float, bool, str] | None = None  # (checked_at, ok, last_error)
+
+    async def ensure_alive(self) -> None:
+        """Quick pre-flight check; raises LLMError if endpoint is unreachable.
+
+        Result is cached for `_HEALTH_TTL_SECONDS` so a flurry of requests in the
+        same conversation doesn't probe the endpoint each time.
+        """
+        now = time.monotonic()
+        if self._health and now - self._health[0] < _HEALTH_TTL_SECONDS:
+            checked_at, ok, last_error = self._health
+            if ok:
+                return
+            raise LLMError(f"LLM endpoint unhealthy (cached): {last_error}")
+
+        # Probe the OpenAI-compat `/models` endpoint with a tight timeout.
+        # On most local LLM servers this returns instantly when alive and refuses
+        # quickly when dead. If the server lacks `/models` we fall back to a
+        # plain TCP connect via httpx, which still rejects fast.
+        parsed = urlparse(self.base_url)
+        probe_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path or ''}/models"
+        try:
+            async with httpx.AsyncClient(timeout=_HEALTH_PROBE_TIMEOUT) as client:
+                resp = await client.get(probe_url)
+                # Anything that responds — even 401/404 — means the server is up.
+                _ = resp.status_code
+            self._health = (now, True, "")
+        except httpx.HTTPError as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            self._health = (now, False, err)
+            raise LLMError(f"LLM endpoint unreachable: {err}") from exc
 
     async def chat(
         self,
@@ -32,6 +72,9 @@ class LLMClient:
     ) -> str:
         if not self.settings.llm_api_key:
             raise LLMError("LLM_API_KEY is not configured")
+
+        # Fail fast if the endpoint is unreachable (cached probe).
+        await self.ensure_alive()
 
         payload: dict[str, Any] = {
             "model": self.settings.llm_model,
@@ -48,6 +91,9 @@ class LLMClient:
                 )
                 response.raise_for_status()
         except httpx.HTTPError as exc:
+            # Invalidate health cache so the next call re-probes instead of
+            # blindly retrying a 60s chat against a dead endpoint.
+            self._health = (time.monotonic(), False, str(exc))
             raise LLMError(f"LLM request failed: {exc}") from exc
 
         data = response.json()
