@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import BigInteger, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -47,7 +47,7 @@ class Price(Base):
     low: Mapped[float | None] = mapped_column(Float)
     close: Mapped[float | None] = mapped_column(Float)
     adj_close: Mapped[float | None] = mapped_column(Float)
-    volume: Mapped[int | None] = mapped_column(Integer)
+    volume: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
