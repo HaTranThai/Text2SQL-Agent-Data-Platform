@@ -196,10 +196,12 @@ class TextToSQLService:
             if err:
                 return "fail" if state.get("attempt", 0) >= 1 else "repair_error"
             rows = state.get("rows") or []
+            sql_text = state.get("sql") or ""
             if (
                 not rows
+                and sql_text
                 and state.get("attempt", 0) < 1
-                and not _should_keep_empty_result(state["question"], state["sql"])
+                and not _should_keep_empty_result(state["question"], sql_text)
             ):
                 return "repair_empty"
             return "explain"
@@ -275,7 +277,7 @@ class TextToSQLService:
 
         async def explain(state: T2SState) -> dict[str, Any]:
             answer = _sanitize_answer(
-                await service._explain(state["question"], state["sql"], state.get("rows") or [])
+                await service._explain(state["question"], state.get("sql") or "", state.get("rows") or [])
             )
             return {"answer": answer, "pipeline": ["explainer"]}
 
