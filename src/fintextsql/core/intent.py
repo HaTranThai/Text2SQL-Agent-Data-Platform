@@ -19,7 +19,9 @@ class RouteDecision:
     reason: str
 
 
-class IntentRouter:
+class RuleBasedRouter:
+    """Fast deterministic router (kept as a fallback for when the LLM is down)."""
+
     def route(self, message: str) -> RouteDecision:
         text = _normalize_text(message)
         raw_lower = message.lower()
@@ -49,50 +51,38 @@ class IntentRouter:
         ) or "đồ thị" in raw_lower:
             return RouteDecision("visualization", "high", tickers, "Visualization keyword detected")
 
-        # Company info — leadership, contacts, headquarters, business summary.
-        # These facts live outside the DB schema; the company_info path will fetch
-        # them live from yfinance.info (and fall back to news search).
-        if tickers and _contains_word(
-            text,
-            [
-                "ceo", "founder", "founders", "headquarters", "headquarter",
-                "ai sang lap", "nguoi sang lap", "ban lanh dao", "lanh dao",
-                "giam doc dieu hanh", "chu tich", "tru so",
-                "website", "trang chu", "homepage",
-                "industry sector", "linh vuc hoat dong", "nganh nghe",
-                "company summary", "gioi thieu cong ty", "cong ty nay lam gi",
-                "ho la ai", "la cong ty gi",
-            ],
-        ):
-            return RouteDecision("company_info", "high", tickers, "Company info keyword detected")
+        # Web search — facts living outside the DB (CEO, founder, headquarters,
+        # website, company summary) AND news/headlines. Both use Tavily + LLM
+        # summarization, so they share one path.
+        web_search_keywords = [
+            # News
+            "news", "headline", "tin tuc", "tin moi", "tin gi", "co tin", "bai bao",
+            # Company facts
+            "ceo", "founder", "founders", "headquarters", "headquarter",
+            "ai sang lap", "nguoi sang lap", "ban lanh dao", "lanh dao",
+            "giam doc dieu hanh", "chu tich", "tru so",
+            "website", "trang chu", "homepage",
+            "industry sector", "linh vuc hoat dong", "nganh nghe",
+            "company summary", "gioi thieu cong ty", "cong ty nay lam gi",
+            "ho la ai", "la cong ty gi",
+        ]
+        if _contains_word(text, web_search_keywords):
+            return RouteDecision("web_search", "high", tickers, "Web search keyword (news or company facts) detected")
 
-        if _contains(
+        # Definition / explanation questions ("P/E là gì?", "drawdown nghĩa là gì",
+        # "what is EBITDA") — these are finance-knowledge questions, not data queries.
+        # Route to general (LLM). We accept up to 1 single-character "ticker" because
+        # extract_tickers often grabs "E" from "P/E" as a false positive.
+        meaningful_tickers = [t for t in tickers if len(t) >= 2]
+        if not meaningful_tickers and _contains_word(
             text,
             [
-                "news",
-                "headline",
-                "tin tuc",
-                "tin moi",
-                "tin gi",
-                "co tin",
-                "bai bao",
+                "la gi", "nghia la gi", "nghia la sao", "co nghia gi",
+                "what is", "explain", "definition of", "giai thich",
+                "dinh nghia", "tinh the nao", "cong thuc",
             ],
         ):
-            return RouteDecision("news", "high", tickers, "News keyword detected")
-
-        if tickers and _contains(
-            text,
-            [
-                "current price",
-                "quote",
-                "last price",
-                "gia hien tai",
-                "gia nhanh",
-                "gia hom nay",
-                "market cap",
-            ],
-        ):
-            return RouteDecision("simple_finance", "medium", tickers, "Simple finance lookup detected")
+            return RouteDecision("general", "high", tickers, "Definition/explanation question (no specific ticker)")
 
         if _is_general_chat(text, tickers=tickers):
             return RouteDecision("general", "high", tickers, "General assistant/help question detected")
@@ -108,6 +98,11 @@ class IntentRouter:
             )
 
         return RouteDecision("text_to_sql", "medium", tickers, "Default analytical path")
+
+
+# Backwards-compat alias — code still importing IntentRouter gets the rule-based
+# one. The LLMIntentRouter (below) is the new default but takes a settings+llm.
+IntentRouter = RuleBasedRouter
 
 
 def _contains(text: str, needles: list[str]) -> bool:

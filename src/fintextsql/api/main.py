@@ -25,6 +25,7 @@ from fintextsql.api.schemas import (
 )
 from fintextsql.core.config import Settings, get_settings
 from fintextsql.core.intent import IntentRouter, RouteDecision
+from fintextsql.core.llm_router import LLMIntentRouter
 from fintextsql.core.policy import PolicyDecision, PolicyGuard
 from fintextsql.core.planner import AgentPlan, PlannedTask, TaskPlanner
 from fintextsql.core.tickers import extract_tickers
@@ -32,9 +33,8 @@ from fintextsql.db.models import Company, QAExample
 from fintextsql.db.session import get_db, init_db
 from fintextsql.ingestion.yfinance_service import YFinanceIngestionService
 from fintextsql.llm.client import LLMClient
-from fintextsql.paths.news.service import NewsService
-from fintextsql.paths.company_info.service import CompanyInfoService
-from fintextsql.paths.simple_finance.service import SimpleFinanceService
+from fintextsql.paths.general.service import GeneralService
+from fintextsql.paths.web_search.service import WebSearchService
 from fintextsql.paths.visualization.service import VisualizationService, infer_visualization
 from fintextsql.text2sql.schema import full_schema_text
 from fintextsql.text2sql.service import TextToSQLService
@@ -158,9 +158,10 @@ async def chat(
     if resolved and resolved != payload.message:
         payload.message = resolved
 
-    router = IntentRouter()
-    agent_plan = TaskPlanner(SESSION_STATE.get(payload.session_id)).plan(payload.message)
-    decision = router.route(payload.message)
+    llm = LLMClient(current_settings)
+    router = LLMIntentRouter(settings=current_settings, llm=llm)
+    decision = await router.route(payload.message)
+    agent_plan = TaskPlanner(SESSION_STATE.get(payload.session_id)).plan(payload.message, decision=decision)
     explicit_tickers = list(decision.tickers)
     should_use_conversation_context = _should_use_conversation_context(payload.message, explicit_tickers)
     conversation_context = _conversation_context_text(payload.session_id) if should_use_conversation_context else ""
@@ -181,7 +182,6 @@ async def chat(
         # like "volume" or "max" from prior result summaries and causes deterministic
         # builders to fire on the wrong intent.
         effective_message = agent_plan.tasks[0].message
-    llm = LLMClient(current_settings)
     text_to_sql = TextToSQLService(db, current_settings, llm)
 
     try:
@@ -197,12 +197,13 @@ async def chat(
             return response
 
         if decision.intent == "general":
+            answer = await GeneralService(settings, llm).answer(payload.message)
             response = ChatResponse(
                 intent="general",
-                answer=_general_chat_answer(payload.message),
+                answer=answer,
                 debug={
                     "router": asdict(decision),
-                    "pipeline": ["general_help"],
+                    "pipeline": ["llm_conversational"],
                     "planner": agent_plan.to_debug(),
                     "task_count": len(agent_plan.tasks),
                     "context_used": agent_plan.context_used,
@@ -245,30 +246,10 @@ async def chat(
             _remember_session_turn(payload.session_id, payload.message, response, decision)
             return response
 
-        if decision.intent == "news":
-            answer, sources = await NewsService(db, llm).answer(payload.message, decision.tickers)
+        if decision.intent == "web_search":
+            answer, sources = await WebSearchService(settings, llm).answer(payload.message, decision.tickers)
             response = ChatResponse(
-                intent="news",
-                answer=answer,
-                rows=sources,
-                columns=list(sources[0].keys()) if sources else [],
-                sources=sources,
-                debug={
-                    "router": asdict(decision),
-                    "pipeline": ["load_news", "analyze_news", "format_sources"],
-                    "planner": agent_plan.to_debug(),
-                    "task_count": len(agent_plan.tasks),
-                    "context_used": agent_plan.context_used,
-                    "resolved_state": agent_plan.resolved_state,
-                },
-            )
-            _remember_session_turn(payload.session_id, payload.message, response, decision)
-            return response
-
-        if decision.intent == "company_info":
-            answer, sources = await CompanyInfoService(settings, llm).answer(payload.message, decision.tickers)
-            response = ChatResponse(
-                intent="company_info",
+                intent="web_search",
                 answer=answer,
                 rows=sources,
                 columns=list(sources[0].keys()) if sources else [],
@@ -276,28 +257,6 @@ async def chat(
                 debug={
                     "router": asdict(decision),
                     "pipeline": ["tavily_search", "llm_summarize"],
-                    "planner": agent_plan.to_debug(),
-                    "task_count": len(agent_plan.tasks),
-                    "context_used": agent_plan.context_used,
-                    "resolved_state": agent_plan.resolved_state,
-                },
-            )
-            _remember_session_turn(payload.session_id, payload.message, response, decision)
-            return response
-
-        if decision.intent == "simple_finance":
-            answer, rows = await SimpleFinanceService(db).answer(payload.message, decision.tickers)
-            columns = list(rows[0].keys()) if rows else []
-            response = ChatResponse(
-                intent="simple_finance",
-                answer=answer,
-                rows=rows,
-                columns=columns,
-                visualization=infer_visualization(payload.message, columns, rows),
-                sources=[{"source": row.get("source"), "ticker": row.get("ticker")} for row in rows],
-                debug={
-                    "router": asdict(decision),
-                    "pipeline": ["quote_lookup", "fallback_postgres_if_needed", "infer_visualization"],
                     "planner": agent_plan.to_debug(),
                     "task_count": len(agent_plan.tasks),
                     "context_used": agent_plan.context_used,
@@ -353,7 +312,10 @@ async def chat(
 
 
 @app.post("/chat/route", response_model=RoutePreviewResponse)
-async def chat_route(payload: ChatRequest) -> RoutePreviewResponse:
+async def chat_route(
+    payload: ChatRequest,
+    current_settings: Settings = Depends(get_settings),
+) -> RoutePreviewResponse:
     policy = PolicyGuard().check(payload.message)
     if policy.triggered:
         return RoutePreviewResponse(
@@ -364,9 +326,10 @@ async def chat_route(payload: ChatRequest) -> RoutePreviewResponse:
             router={"intent": "general", "confidence": "high", "tickers": [], "policy_guard": policy.to_debug()},
         )
 
-    router = IntentRouter()
-    decision = router.route(payload.message)
-    agent_plan = TaskPlanner(SESSION_STATE.get(payload.session_id)).plan(payload.message)
+    llm = LLMClient(current_settings)
+    router = LLMIntentRouter(settings=current_settings, llm=llm)
+    decision = await router.route(payload.message)
+    agent_plan = TaskPlanner(SESSION_STATE.get(payload.session_id)).plan(payload.message, decision=decision)
     explicit_tickers = list(decision.tickers)
     context_tickers = _resolve_context_tickers(payload.session_id, payload.message, decision.tickers)
     if context_tickers:
@@ -421,25 +384,25 @@ async def _execute_planned_task(
     settings: Settings,
     llm: LLMClient,
 ) -> TaskResult:
-    if task.intent == "news":
-        answer, sources = await NewsService(db, llm).answer(task.message, task.tickers)
+    if task.intent == "web_search":
+        answer, sources = await WebSearchService(settings, llm).answer(task.message, task.tickers)
         return TaskResult(
-            intent="news",
-            title=task.title,
-            answer=answer,
-            rows=sources,
-            columns=list(sources[0].keys()) if sources else [],
-            debug={"pipeline": ["load_news", "analyze_news", "format_sources"], "task": asdict(task)},
-        )
-    if task.intent == "company_info":
-        answer, sources = await CompanyInfoService(settings, llm).answer(task.message, task.tickers)
-        return TaskResult(
-            intent="company_info",
+            intent="web_search",
             title=task.title,
             answer=answer,
             rows=sources,
             columns=list(sources[0].keys()) if sources else [],
             debug={"pipeline": ["tavily_search", "llm_summarize"], "task": asdict(task)},
+        )
+    if task.intent == "general":
+        answer = await GeneralService(settings, llm).answer(task.message)
+        return TaskResult(
+            intent="general",
+            title=task.title,
+            answer=answer,
+            rows=[],
+            columns=[],
+            debug={"pipeline": ["llm_conversational"], "task": asdict(task)},
         )
     text_to_sql = TextToSQLService(db, settings, llm)
     if task.intent == "visualization":
@@ -526,57 +489,37 @@ def _period_from_message(message: str) -> str:
 
 def _preview_pipeline(intent: str) -> list[str]:
     if intent == "general":
-        return ["general_help"]
+        return ["llm_conversational"]
     if intent == "ingestion":
         return ["parse_ingestion_request", "fetch_yfinance", "upsert_postgres"]
-    if intent == "news":
-        return ["load_news", "analyze_news", "format_sources"]
-    if intent == "company_info":
+    if intent == "web_search":
         return ["tavily_search", "llm_summarize"]
-    if intent == "simple_finance":
-        return ["quote_lookup", "fallback_postgres_if_needed", "infer_visualization"]
     if intent == "visualization":
         return [
             "load_schema",
+            "schema_cache",
+            "knowledge_extractor",
             "schema_selector",
             "planner",
             "sql_generator",
-            "sql_guard",
+            "candidate_generator_x3",
+            "candidate_selector",
             "execute_sql",
             "explainer",
             "infer_visualization",
         ]
-    return ["load_schema", "schema_selector", "planner", "sql_generator", "sql_guard", "execute_sql", "explainer"]
-
-
-def _general_chat_answer(message: str) -> str:
-    text = _strip_vietnamese_accents(message.lower())
-    if any(word in text for word in ["xin chao", "hello", "hi"]):
-        opener = "Chào bạn. Mình là trợ lý phân tích dữ liệu tài chính của FinTextSQL."
-    else:
-        opener = "Mình có thể hỗ trợ bạn phân tích dữ liệu tài chính bằng câu hỏi tự nhiên."
-
-    return "\n".join(
-        [
-            opener,
-            "",
-            "### Mình làm tốt các việc này",
-            "- Tra cứu và so sánh giá đóng cửa, volume, market cap, P/E, beta.",
-            "- Sinh SQL an toàn từ câu hỏi và trả bảng kết quả.",
-            "- Vẽ chart giá theo thời gian cho một hoặc nhiều mã.",
-            "- Lấy và tóm tắt tin tức có thể ảnh hưởng tới một ticker.",
-            "- Nhớ ngữ cảnh ngắn hạn trong cùng cuộc trò chuyện, ví dụ “các mã đó”, “cùng khoảng thời gian”, “cái đó”.",
-            "",
-            "### Ví dụ bạn có thể hỏi",
-            "- `Giá đóng cửa cao nhất trong 8 tháng qua của AAPL là ngày nào?`",
-            "- `Liệt kê giá đóng cửa cao nhất từng tháng của AAPL trong 8 tháng qua`",
-            "- `So sánh AAPL, MSFT, NVDA trong 180 ngày gần nhất`",
-            "- `Có tin gì mới có thể ảnh hưởng tới giá Apple không?`",
-            "- `Vẽ chart giá đóng cửa của AAPL và MSFT trong 60 ngày gần nhất`",
-            "",
-            "Bạn cứ hỏi như đang nói chuyện bình thường; nếu viết `apple`, `appl` hoặc lỡ gõ `apply`, mình sẽ hiểu là `AAPL`.",
-        ]
-    )
+    return [
+        "load_schema",
+        "schema_cache",
+        "knowledge_extractor",
+        "schema_selector",
+        "planner",
+        "sql_generator",
+        "candidate_generator_x3",
+        "candidate_selector",
+        "execute_sql",
+        "explainer",
+    ]
 
 
 def _resolve_context_tickers(

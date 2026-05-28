@@ -10,7 +10,6 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from fintextsql.db.models import Company, Fundamental, IngestionRun, Price
-from fintextsql.paths.news.service import NewsService
 
 
 class YFinanceIngestionService:
@@ -75,12 +74,12 @@ class YFinanceIngestionService:
             self._upsert_fundamentals(company.id, info)
             rows_loaded += 1
 
-        if include_news:
-            try:
-                articles = await NewsService(self.db).fetch_and_store(ticker=ticker, limit=10)
-                rows_loaded += len(articles)
-            except Exception:
-                pass
+        # News ingestion was retired together with the news/company_info paths.
+        # The unified web_search path now uses Tavily live at query time, so we
+        # no longer pre-populate news_articles from RSS during ingestion.
+        # The include_news flag is kept in the IngestionRequest schema for
+        # backwards compatibility with old API clients but is now a no-op.
+        _ = include_news
 
         self.db.commit()
         return rows_loaded

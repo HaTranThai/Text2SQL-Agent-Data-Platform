@@ -44,7 +44,14 @@ class TaskPlanner:
         self.state = state or {}
         self.router = IntentRouter()
 
-    def plan(self, message: str) -> AgentPlan:
+    def plan(self, message: str, decision=None) -> AgentPlan:
+        """Plan tasks from a question.
+
+        `decision` (RouteDecision) can be passed in so the planner reuses an
+        upstream LLM router result instead of re-running the rule router. When
+        omitted, falls back to the embedded rule-based router for backward
+        compat.
+        """
         text = _normalize_text(message)
         explicit_tickers = extract_tickers(message)
         context_used = _is_follow_up(text) or (
@@ -57,14 +64,15 @@ class TaskPlanner:
         comparison = _infer_comparison(text)
         wants_chart = _contains_any(text, ["chart", "ve chart", "ve bieu do", "bieu do", "do thi", "plot", "visualize"])
 
-        route = self.router.route(message)
+        route = decision if decision is not None else self.router.route(message)
         base_intent = route.intent
-        if _contains_any(text, ["tin tuc", "tin moi", "co tin", "news", "headline", "bai bao"]):
-            base_intent = "news"
+        # Web search covers both news AND company facts (CEO, founder, website).
+        if route.intent == "web_search":
+            base_intent = "web_search"
+        elif _contains_any(text, ["tin tuc", "tin moi", "co tin", "news", "headline", "bai bao"]):
+            base_intent = "web_search"
         elif wants_chart and not _contains_any(text, ["so sanh", "compare", "xu huong", "trend"]):
             base_intent = "visualization"
-        elif metric in {"current_price"} and tickers:
-            base_intent = "simple_finance"
         elif route.intent == "general":
             base_intent = "general"
         else:
@@ -226,8 +234,8 @@ def _infer_comparison(text: str) -> str | None:
 def _task_title(intent: str, metric: str | None, grouping: str | None, comparison: str | None) -> str:
     if comparison == "latest_quarter_vs_previous":
         return "So sánh quý gần nhất với quý trước"
-    if intent == "news":
-        return "Tin tức liên quan"
+    if intent == "web_search":
+        return "Tra cứu web"
     if grouping:
         return f"Phân tích theo {grouping}"
     if metric:

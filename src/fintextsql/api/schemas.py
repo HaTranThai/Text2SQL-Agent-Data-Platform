@@ -8,10 +8,8 @@ IntentName = Literal[
     "general",
     "text_to_sql",
     "visualization",
-    "news",
+    "web_search",
     "ingestion",
-    "simple_finance",
-    "company_info",
 ]
 
 
