@@ -723,3 +723,73 @@ T2: thế còn volume thì sao
 T3: 90 ngày đó TSLA có bao nhiêu phiên tăng giá?
 ```
 Kỳ vọng: T2 = volume TSLA 90 ngày; T3 = đếm phiên tăng của TSLA trong 90 ngày.
+
+
+
+🟦 general — Kiến thức, định nghĩa, chào hỏi (10 câu)
+
+P/E ratio là gì? Cách tính như thế nào?
+Drawdown nghĩa là gì? Có ý nghĩa gì trong đầu tư?
+EBITDA tính ra sao? Tại sao analyst hay dùng?
+MA20 và MA50 khác nhau chỗ nào?
+Beta của cổ phiếu nghĩa là gì?
+Warren Buffett là ai?
+Thị trường gấu (bear market) là gì?
+IPO là gì? Quy trình IPO diễn ra như thế nào?
+Free cash flow tính bằng công thức nào?
+Xin chào, bạn làm được gì?
+
+🟩 text_to_sql — Truy vấn dữ liệu (12 câu)
+
+Giá đóng cửa cao nhất của AAPL trong năm 2024 là bao nhiêu?
+So sánh giá đóng cửa của AAPL, MSFT, NVDA trong 30 ngày qua
+P/E của AAPL hiện tại là bao nhiêu?
+Mã nào có volume cao nhất trong tuần qua
+Liệt kê giá đóng cửa từng tháng của TSLA năm 2023
+Drawdown lớn nhất của TSLA trong năm 2022 là bao nhiêu?
+Top 10 mã có market cap lớn nhất hiện tại
+Trung bình giá đóng cửa của GOOG quý 2 năm 2024
+Có bao nhiêu phiên tăng liên tiếp dài nhất của NVDA trong năm qua?
+So sánh tăng trưởng giá AAPL năm 2022 và 2024
+Mã nào có MA20 cắt MA50 hiện tại
+Tương quan giữa volume và return của AAPL trong 90 ngày qua
+
+🟧 visualization — Vẽ biểu đồ (8 câu)
+
+Vẽ chart giá đóng cửa của AAPL trong 60 ngày qua
+Biểu đồ so sánh AAPL và MSFT trong 6 tháng qua
+Đồ thị MA20 và MA50 của TSLA năm 2024
+Vẽ biểu đồ phân tán volume vs daily return của AAPL trong 90 ngày
+Scatterplot volume và % thay đổi của 3 mã AAPL, MSFT, GOOG
+Plot top 10 mã tăng mạnh nhất 30 ngày qua
+Vẽ chart so sánh tăng trưởng theo năm của AAPL, MSFT năm 2022 và 2024
+Biểu đồ cột tổng volume từng tháng của NVDA năm 2024
+
+🟨 web_search — Tin tức + thông tin công ty (10 câu)
+
+CEO của Apple hiện tại là ai?
+Trụ sở Microsoft ở đâu?
+Website chính thức của NVDA là gì?
+Ai sáng lập Tesla?
+Giới thiệu công ty Adobe — họ làm gì?
+Tin tức mới nhất về Tesla
+Có tin gì có thể ảnh hưởng tới giá AAPL không?
+Headline gần đây của thị trường công nghệ
+Apple làm ăn thế nào gần đây?
+Tin tức Nvidia về AI chip mới nhất
+
+🟪 ingestion — Sync dữ liệu (3 câu)
+
+Ingest dữ liệu cho AAPL, MSFT, NVDA
+Cập nhật dữ liệu mới nhất cho TSLA trong 5 ngày qua
+Sync 10 mã top NASDAQ
+
+⚠️ Edge case — Khó cho rule-based, LLM xử lý tốt (7 câu)
+
+Apple gần đây ổn không?
+Nvidia có gì đáng chú ý tuần này?
+Cho tôi biết tình hình kinh doanh Microsoft
+Tôi muốn xem hiệu suất AAPL so với S&P 500 năm ngoái
+Tesla đang làm gì với robotaxi?
+mã apple ngon không, tôi nên nghĩ thế nào về nó
+chỉ số thị trường hôm nay

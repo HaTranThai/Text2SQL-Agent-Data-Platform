@@ -1,567 +1,520 @@
 # FinTextSQL — Trợ lý Phân tích Dữ liệu Tài chính bằng Ngôn ngữ Tự nhiên
 
-> Báo cáo đồ án — Đại học `<Tên trường>`
-> Học phần `<Tên học phần>` — Học kỳ `<Học kỳ / Năm học>`
+> Hệ thống hỏi đáp dữ liệu chứng khoán bằng tiếng Việt/Anh tự nhiên — sinh SQL an toàn,
+> tra cứu tin tức + thông tin công ty qua web search, vẽ biểu đồ tự động và streaming
+> response theo phong cách ChatGPT.
+
+![FinTextSQL Home](docs/picture/01_home.png)
 
 ---
 
-## 1. Thông tin đề tài
+## Mục lục
 
-| Mục | Nội dung |
-|---|---|
-| **Tên đề tài** | FinTextSQL — Hệ thống Hỏi đáp Dữ liệu Tài chính bằng Ngôn ngữ Tự nhiên (Text-to-SQL + Multi-path Agent) |
-| **Lĩnh vực** | Natural Language Processing, Text-to-SQL, Financial Data Analytics |
-| **Giảng viên hướng dẫn** | `<Họ và tên GV — Học hàm/Học vị>` |
-| **Đơn vị** | `<Khoa / Bộ môn>` |
-| **Thời gian thực hiện** | `<Tháng/Năm bắt đầu>` – `<Tháng/Năm kết thúc>` |
-
-### Thành viên nhóm
-
-| STT | Họ và tên | MSSV | Vai trò chính |
-|---|---|---|---|
-| 1 | `<Họ và tên>` | `<MSSV>` | `<Vai trò: Team Lead / Backend / Frontend / Data / Báo cáo>` |
-| 2 | `<Họ và tên>` | `<MSSV>` | `<Vai trò>` |
-| 3 | `<Họ và tên>` | `<MSSV>` | `<Vai trò>` |
-| 4 | `<Họ và tên>` | `<MSSV>` | `<Vai trò>` |
+1. [Giới thiệu](#1-giới-thiệu)
+2. [Demo các tính năng chính](#2-demo-các-tính-năng-chính)
+3. [Kiến trúc hệ thống](#3-kiến-trúc-hệ-thống)
+4. [Pipeline Text-to-SQL](#4-pipeline-text-to-sql)
+5. [Tính năng nổi bật](#5-tính-năng-nổi-bật)
+6. [Công nghệ sử dụng](#6-công-nghệ-sử-dụng)
+7. [Cài đặt và chạy thử](#7-cài-đặt-và-chạy-thử)
+8. [Cấu trúc dự án](#8-cấu-trúc-dự-án)
+9. [Hạn chế và hướng phát triển](#9-hạn-chế-và-hướng-phát-triển)
+10. [Tham khảo](#10-tham-khảo)
 
 ---
 
-## 2. Phân tích yêu cầu bài toán
+## 1. Giới thiệu
 
-### 2.1 Bối cảnh
+### Vấn đề thực tế
 
-Dữ liệu chứng khoán (giá, khối lượng, fundamentals, tin tức) là nguồn thông tin quan trọng cho nhà đầu tư cá nhân, sinh viên ngành tài chính, và nhà phân tích dữ liệu. Tuy nhiên:
+Dữ liệu chứng khoán (giá, khối lượng, fundamentals, tin tức) là nguồn thông tin quan trọng cho nhà đầu tư cá nhân, sinh viên ngành tài chính và nhà phân tích dữ liệu. Tuy nhiên có 4 rào cản chính:
 
 - **Người không biết SQL** không tự truy vấn được, phải chờ dev hoặc dùng dashboard cố định.
-- **Dashboard cố định** chỉ trả lời được câu hỏi đã pre-define; câu hỏi mới = đợi build chart mới.
-- **LLM tổng quát** (ChatGPT, Gemini) trả lời sai dữ liệu cụ thể (vd "giá AAPL ngày 12/03/2024") vì không có kết nối DB real-time.
-- **Câu hỏi tài chính có nhiều dạng**: có dạng tra cứu dữ liệu thuần (cần SQL), có dạng tra cứu fact (CEO, trụ sở — cần web search), có dạng tin tức (cần RSS), có dạng so sánh trực quan (cần chart).
+- **Dashboard cố định** chỉ trả lời câu hỏi đã pre-define; câu hỏi mới = đợi build chart mới.
+- **LLM tổng quát** (ChatGPT, Gemini) trả lời sai dữ liệu cụ thể vì không có kết nối DB real-time.
+- **Câu hỏi tài chính đa dạng** — có dạng truy vấn DB, dạng tra fact (CEO, trụ sở), dạng tin tức, dạng biểu đồ — mỗi loại cần pipeline khác.
 
-### 2.2 Mục tiêu
+### Giải pháp đề xuất
 
-Xây dựng một hệ thống chat tài chính có thể:
+FinTextSQL là một hệ thống **Multi-path Agent** kết hợp 3 kỹ thuật cốt lõi:
 
-1. **Hiểu câu hỏi tiếng Việt/Anh tự nhiên** — kể cả khi viết ngắn gọn, viết tắt, sai chính tả ticker (vd "apple" → AAPL).
-2. **Tự phân loại câu hỏi** thành 7 luồng xử lý phù hợp, không bắt user chọn tab/menu.
-3. **Sinh SQL an toàn** — chỉ SELECT, whitelist bảng, chống injection.
-4. **Trả lời tiếng Việt** kèm bảng kết quả, biểu đồ, và "thinking trace" để người dùng biết hệ thống đang làm gì.
-5. **Nhớ ngữ cảnh hội thoại** — câu sau có thể nói "còn TSLA thì sao", "cùng khoảng thời gian đó", "2 năm này", hệ thống tự hiểu.
-6. **Đóng gói chạy local** — dùng LLM local (không cần OpenAI API key), Postgres + Docker Compose; có Cloudflare Tunnel cho demo công khai.
+1. **LLM-first Intent Router** — gọi LLM phân loại câu hỏi vào 1 trong 5 luồng xử lý, fallback rule-based khi LLM down.
+2. **LangGraph Text-to-SQL Pipeline** — orchestrate sinh SQL → guard → execute → repair → explain theo state machine, có cross-session memory.
+3. **Tavily Web Search Integration** — tra cứu tin tức và fact ngoài database (CEO, founder, headquarters) bằng web search engine chuyên cho AI.
 
-### 2.3 Yêu cầu chức năng
+Output: trả lời **tiếng Việt tự nhiên** kèm **bảng dữ liệu**, **biểu đồ tự động** (line/bar/scatter), và **SSE streaming** để user thấy response chạy như ChatGPT.
 
-| ID | Yêu cầu | Ưu tiên |
-|---|---|---|
-| FR-01 | Người dùng đặt câu hỏi qua giao diện chat, nhận trả lời dạng văn bản tiếng Việt | Must |
-| FR-02 | Hệ thống tự phân loại **5 intent** (LLM-classified): text_to_sql, visualization, web_search, ingestion, general | Must |
-| FR-03 | Sinh SQL từ câu hỏi và chạy trên Postgres, trả về bảng | Must |
-| FR-04 | Vẽ biểu đồ (line/bar/area/scatter) cho dữ liệu time-series | Must |
-| FR-05 | Tra cứu tin tức + thông tin công ty (CEO, founder, website) qua **Tavily web search + LLM tóm tắt** (unified `web_search` path) | Must |
-| FR-06 | Trả lời câu hỏi kiến thức tài chính phổ thông (P/E là gì, Warren Buffett là ai...) qua LLM với persona FinTextSQL | Should |
-| FR-07 | Nhớ ngữ cảnh đa lượt: ticker, time_window, metric | Must |
-| FR-08 | Sync dữ liệu yfinance theo yêu cầu (manual + scheduler) | Must |
-| FR-09 | Cross-session memory: học từ Q→SQL đã chạy thành công | Should |
-| FR-10 | Hiển thị thinking trace (pipeline step-by-step) | Should |
+### Đối tượng người dùng
 
-### 2.4 Yêu cầu phi chức năng (NFR)
-
-| ID | Tiêu chí | Target |
-|---|---|---|
-| NFR-PERF-01 | API `/chat` (text_to_sql) — Response P95 | < 10 giây (gồm LLM router + planner + SQL gen + execute + explain) |
-| NFR-PERF-02 | LLM router classification — P95 | < 800ms (1 LLM call, max_tokens=200) |
-| NFR-SEC-01 | SQL injection / DDL / DML | 0 — guard chặn 100% |
-| NFR-SEC-02 | Stack trace leak ra client | 0 |
-| NFR-AVAIL-01 | Uptime trong giờ demo | ≥ 99% |
-| NFR-COMPAT-01 | Browser support | Chrome ≥ 100, Edge ≥ 100, Safari ≥ 15 |
-| NFR-MAINT-01 | Test coverage (đo bằng pytest) | ≥ 60% domain logic |
+- Nhà đầu tư cá nhân muốn phân tích nhanh mà không biết SQL.
+- Sinh viên ngành tài chính học cách khai thác dữ liệu thực.
+- Nhà phân tích/dev muốn prototype công cụ chat tài chính nội bộ.
 
 ---
 
-## 3. Phương pháp đề xuất
+## 2. Demo các tính năng chính
 
-### 3.1 Mô hình tổng quát
+### 2.1 Giao diện trang chủ
 
-Hệ thống dùng kiến trúc **Multi-path Agent với LLM-first Routing**, kết hợp:
+Giao diện chat phong cách ChatGPT với:
 
-- **LLM Intent Router** — gọi LLM 1 lần để phân loại + extract ticker, parse JSON; fallback rule-based khi LLM down.
-- **LangGraph StateGraph** — orchestrate pipeline Text-to-SQL gồm `build_sql → execute → explain/repair/fail`.
-- **LLM Candidate Generation x3 + Execute-based Selection** — sinh 3 SQL ứng viên 1 lần, chọn câu chạy ra kết quả tốt nhất.
-- **SQL Guard với sqlglot** — parse AST thật để validate, không dùng regex thuần.
-- **Cross-session Few-shot Memory** — học từ Q→SQL thành công, embed bằng feature-hash MD5 256-dim (không cần pgvector).
-- **Tavily Web Search** — `web_search` path xử lý cả news lẫn company facts.
-- **LLM Conversational** — `general` path trả lời câu hỏi kiến thức tài chính phổ thông.
+- **Sidebar trái**: list 102 mã NASDAQ-100 đã ingest, nút sync, bộ nhớ Q→SQL, đổi theme sáng/tối.
+- **Khu vực chat trung tâm**: hiển thị greeting, gợi ý câu hỏi mẫu.
+- **Composer dưới**: ô nhập "Hỏi bất cứ điều gì..." kèm gợi ý câu hỏi mở rộng.
 
-```
-                       ┌──────────────────────┐
-   Câu hỏi    ─────►   │  Policy Guard        │  (chặn out-of-scope)
-                       └──────────┬───────────┘
-                                  ▼
-                       ┌──────────────────────┐
-                       │  Follow-up Rewriter  │  (resolve "còn X thì sao",
-                       └──────────┬───────────┘   "cùng khoảng đó"...)
-                                  ▼
-                       ┌──────────────────────┐
-                       │  LLM Intent Router   │  ┌─► ingestion       (yfinance)
-                       │  (5 intent, JSON)    │  ├─► visualization   (text2sql + chart)
-                       └──────────┬───────────┘  ├─► web_search      (Tavily + LLM)
-                                  │              ├─► general         (LLM persona)
-                                  ▼              └─► text_to_sql     (LangGraph pipeline)
-                       ┌──────────────────────┐
-                       │  Task Planner        │  (reuse decision từ router)
-                       └──────────┬───────────┘
-                                  │
-                                  ▼
-                          [Multi-task dispatch nếu cần]
-                                  │
-                                  ▼
-                       ┌──────────────────────┐
-                       │  Response Builder    │  (answer + rows + SQL +
-                       └──────────┬───────────┘   chart spec + trace)
-                                  ▼
-                       ┌──────────────────────┐
-                       │  Session State Store │  (in-memory, 8 turn)
-                       └──────────────────────┘
-```
+![Home Screen](docs/picture/01_home.png)
 
-### 3.2 Pipeline Text-to-SQL (chi tiết)
+### 2.2 Text-to-SQL — Sinh SQL và trả về bảng dữ liệu
 
-```
-                    ┌────────────────────┐
-                    │   Build SQL Node   │
-                    │  ┌──────────────┐  │
-                    │  │ Deterministic │ │ ────► match? Yes ──► SQL direct
-                    │  │   matcher    │ │
-                    │  └──────────────┘  │
-                    │         │ No       │
-                    │         ▼          │
-                    │  Knowledge Extract │  (ticker, time, glossary)
-                    │  Schema Selector   │  (chọn bảng liên quan)
-                    │  Planner (LLM)     │  (sinh plan ngắn)
-                    │  Candidate Gen×3   │  (3 SQL/lần gọi LLM)
-                    │  Few-shot Inject   │  (top-3 cosine similar)
-                    │  SQL Guard         │  (sqlglot validate)
-                    └──────────┬─────────┘
-                               ▼
-                    ┌────────────────────┐
-                    │   Execute Node     │
-                    │  Score-based pick  │
-                    └──────────┬─────────┘
-                               │
-            ┌──────────────────┼──────────────────┐
-            │                  │                  │
-       error,att<1       empty,att<1            ok
-            │                  │                  │
-            ▼                  ▼                  ▼
-      ┌─────────┐        ┌─────────┐        ┌────────────────┐
-      │ Repair  │        │ Repair  │        │   Explainer    │
-      │ Error   │ ─────► │ Empty   │ ─────► │  (20 deter +   │
-      │ (LLM)   │        │ (LLM)   │        │   LLM fallback)│
-      └─────────┘        └─────────┘        └────────────────┘
-                                                     │
-                                                     ▼
-                                                  Response
-```
+Khi user hỏi câu cần truy vấn database, intent router phân loại vào `text_to_sql` và pipeline LangGraph chạy:
 
-**Lý do thiết kế Deterministic-first:**
+- **Nhận câu hỏi**
+- **Intent Router** phân loại
+- **Load Schema** đọc cấu trúc DB
+- **Schema Cache** (`@lru_cache`)
+- **Knowledge Extractor** tách ticker + glossary
+- **Schema Selector** lọc bảng liên quan
 
-LLM (kể cả GPT-4) thường sinh SQL sai cho các metric tài chính có công thức cố định (vd: drawdown, MA, year-over-year return). Việc giao việc cho LLM dẫn đến:
-- SQL chạy được nhưng tính sai công thức.
-- LLM "đoán" tên cột không tồn tại.
-- Slow (3-10s/request).
+Hệ thống hiển thị **Thinking Trace** trực quan để user theo dõi từng bước:
 
-Giải pháp: viết tay ~32 SQL builder cho các pattern phổ biến. Khi câu hỏi match (vd có ticker + năm + keyword "return") → bypass LLM, dùng SQL hard-code → **< 200ms** và **100% chính xác công thức**.
+![Text-to-SQL Pipeline](docs/picture/02_text_to_sql.png)
 
-### 3.3 Mô hình Intent Router
+Câu hỏi mẫu: *"Giá đóng cửa cao nhất của AAPL trong năm 2024 là bao nhiêu?"*
 
-**LLM-first** (default) — `core/llm_router.py`. Gọi LLM 1 lần với prompt phân loại + extract ticker:
+### 2.3 Visualization — Vẽ biểu đồ tự động
 
-```python
-async def route(message):
-    raw = await llm.chat([
-        SYSTEM_PROMPT,   # định nghĩa 5 intent + ranh giới gây nhầm
-        USER_MESSAGE,    # câu hỏi nguyên văn
-    ], temperature=0, max_tokens=200, timeout=8s)
+Path `visualization` gọi `text_to_sql` nội bộ để lấy dữ liệu, sau đó **tự suy ra** `VisualizationSpec` (line / bar / area / scatter) dựa trên schema kết quả.
 
-    parsed = parse_json(raw)             # {"intent", "tickers", "reason"}
-    if parsed.intent in VALID_INTENTS:
-        return RouteDecision(parsed.intent, parsed.tickers, parsed.reason)
+Output: chart Recharts kèm bảng dữ liệu + nút xem SQL gốc.
 
-    return rule_based_router.route(message)  # fallback
-```
+![Visualization Chart](docs/picture/03_visualization.png)
 
-**Rule-based fallback** — `core/intent.py::RuleBasedRouter`. Vẫn dùng khi LLM down/timeout/JSON malformed:
+Câu hỏi mẫu: *"Vẽ chart giá đóng cửa của AAPL và MSFT trong 60 ngày qua"*
 
-```python
-def route(message):
-    text = normalize(message)              # strip dấu + lowercase
-    tickers = extract_tickers(message)     # regex + alias map
+### 2.4 Web Search — Tra cứu tin tức và fact ngoài DB
 
-    if has_keyword(text, INGEST_KW):       return "ingestion"
-    if has_word(text, CHART_KW):           return "visualization"
-    if has_word(text, WEB_SEARCH_KW):      return "web_search"   # gộp news + company_info
-    if not meaningful_tickers and has_word(text, DEFINITION_KW): return "general"
-    if is_general_chat(text):              return "general"
-    if not tickers and not has_analytical_signal(text):
-        return "general"  # low confidence
-    return "text_to_sql"   # default
-```
+Path `web_search` xử lý câu hỏi cần thông tin **ngoài database** (CEO, founder, tin tức, website công ty). Pipeline:
 
-**Word-boundary match (regex `(?<!\w)needle(?!\w)`)** trong rule-based router giải quyết bug "đồ thị" match nhầm trong "cái đó thì cái nào" sau khi strip dấu.
+- **Intent Router** phát hiện keyword "CEO / tin tức / ai là..."
+- **Tavily Search** query web với context current year + ticker name
+- **LLM Summarize** tóm tắt tiếng Việt từ snippet, cite nguồn URL
+- **Response** trả về answer + sources table
 
-**Vì sao LLM-first?** Rule-based fail với các câu cần hiểu ngữ nghĩa: "Apple làm ăn thế nào gần đây" (cần web_search vì hỏi tình hình cập nhật, không có keyword "tin tức/news") hoặc "P/E ratio là gì" (cần general vì là câu hỏi định nghĩa, dù có ticker giả "E"). LLM xử lý chính xác các case này; cost +200-500ms/request.
+![Web Search Trace](docs/picture/02_web_search.png)
 
-### 3.4 Cross-session Memory
+Câu hỏi mẫu: *"CEO của Apple hiện tại là ai?"*
 
-Mỗi query thành công lưu vào bảng `qa_examples`:
+Bảng kết quả hiển thị các nguồn web với title, URL và snippet để user verify:
 
-```
-question         → "Top 5 ticker có volume cao nhất 30 ngày qua"
-sql              → "SELECT c.ticker, SUM(p.volume) ..."
-embedding        → feature-hash MD5 256-dim, L2-normalized
-use_count        → +1 mỗi lần dedupe trigger
-created_at       → timestamptz
-```
+![Web Search Sources](docs/picture/02_general.png)
 
-Khi có query mới, tính cosine similarity với toàn bộ memory; lấy top-3 nếu score ≥ 0.18, inject vào prompt LLM dưới dạng few-shot example.
+### 2.5 Multi-turn Follow-up — Hỗ trợ hội thoại đa lượt
 
-**Lý do dùng feature-hash thay vì sentence-embedding model:**
-- Không cần download model (free disk + RAM).
-- Không cần pgvector.
-- Không cần GPU inference.
-- Cosine giữa Q→Q tương tự về **lexical pattern** (cùng metric, cùng kiểu so sánh) — đủ tốt cho few-shot, vì SQL bị bound vào schema cố định.
+Hệ thống ghi nhớ ngữ cảnh trong cùng session để xử lý câu hỏi follow-up như *"còn TSLA thì sao"*, *"cùng khoảng thời gian đó"*, *"2 năm này"*…
 
-### 3.5 Follow-up Resolution
+**Ví dụ luồng 2 câu hỏi**:
 
-5 case xử lý câu hỏi đa lượt:
+**Câu 1**: *"So sánh close price của AAPL và MSFT trong 30 ngày gần nhất"*
 
-| Case | Ví dụ | Hành động |
-|---|---|---|
-| A | "còn TSLA thì sao" | Swap/merge ticker, reuse metric + window |
-| B | "thế còn volume thì sao" | Swap metric, reuse ticker + window |
-| C | "tương tự thì sao" | Reuse câu hỏi trước nguyên văn |
-| D | "trong 7 ngày gần nhất" | Swap time window, reuse ticker + metric |
-| E | "cả 2 năm này", "các năm trên" | Multi-period: extract năm từ history, merge |
+Hệ thống trả về phân tích chi tiết:
+- Diễn biến từng mã từ đầu kỳ đến cuối kỳ
+- Mức tăng tuyệt đối + tăng %
+- Nhận xét chính (AAPL tăng mạnh hơn, MSFT đi ngang…)
+- Kết luận ngắn
 
-Implementation: `_rewrite_follow_up()` trong `api/main.py:1093`. Sau khi rewrite, câu hỏi trở thành self-contained và đi qua pipeline bình thường.
+![Multi-turn Question 1](docs/picture/02_multi_turn_1.png)
+
+**Câu 2 (follow-up)**: *"Vậy nếu so với TSLA thì như thế nào"*
+
+Hệ thống tự động:
+- Lấy lại context "30 ngày gần nhất, close price"
+- Thêm TSLA vào danh sách so sánh (giờ là 3 mã)
+- Sinh lại SQL với điều kiện mới
+- Vẽ chart `Close Price by Date` với 3 đường (AAPL, MSFT, TSLA)
+- Tóm tắt nhận xét + ranking
+
+![Multi-turn Question 2](docs/picture/02_multi_turn_2.png)
+
+→ User không cần lặp lại "30 ngày qua" hay "close price" — hệ thống hiểu từ ngữ cảnh.
 
 ---
 
-## 4. Thực nghiệm
+## 3. Kiến trúc hệ thống
 
-### 4.1 Dữ liệu
+![System Architecture](docs/picture/architecture.jpg)
 
-#### 4.1.1 Nguồn dữ liệu
+### Luồng request từ user → response
 
-| Nguồn | Loại | Quy mô |
+1. **User** gõ câu hỏi tiếng Việt/Anh trên giao diện chat.
+2. **Frontend (React)** gửi `POST /chat` hoặc `POST /chat/stream` qua HTTP/SSE.
+3. **Backend FastAPI** xử lý qua 5 bước tuần tự:
+   1. **PolicyGuard** — chặn câu out-of-scope (DDL, secrets, investment advice).
+   2. **Follow-up rewrite** — viết lại câu cho self-contained nếu là follow-up multi-turn.
+   3. **LLM Intent Router** — phân loại 5 intent (text_to_sql / visualization / web_search / ingestion / general).
+   4. **TaskPlanner** — sinh 1-N task tương ứng với intent.
+   5. **Branch theo intent** — dispatch task tới path service phù hợp.
+4. **5 path services** xử lý độc lập:
+   - **`text_to_sql`** — LangGraph pipeline, đọc/ghi PostgreSQL.
+   - **`visualization`** — gọi `text_to_sql` nội bộ + chart inferencer.
+   - **`web_search`** — Tavily Search API + LLM tóm tắt.
+   - **`ingestion`** — yfinance + upsert PostgreSQL.
+   - **`general`** — LLM conversational với persona FinTextSQL.
+5. **ChatResponse + session memory** — assemble response object trong RAM (không đọc từ PG trực tiếp).
+6. **Frontend render** — text + table + chart (Recharts).
+
+### Sidecar — Scheduler
+
+Container `scheduler` chạy **cron mỗi 10 phút** trong giờ NASDAQ (13:30-22:00 UTC, T2-T6), gọi `POST /ingest` để tự cập nhật bar daily đang chạy cho 100 mã NASDAQ-100.
+
+### External services (ngoài Docker Compose)
+
+- **LLM endpoint** — OpenAI-compatible API qua `httpx`, model `cx/gpt-5.4`.
+- **yfinance** — Python library import, lấy prices + fundamentals từ Yahoo Finance.
+- **Tavily Search API** — REST API qua `httpx`, search engine chuyên cho AI agent.
+
+### Docker Compose Stack (5 service)
+
+| Service | Mô tả | Port |
 |---|---|---|
-| **yfinance** | Giá OHLCV daily, fundamentals (P/E, market cap, beta...) | NASDAQ-100 (100 ticker), 10 năm (~2016–2026) |
-| **Yahoo Finance RSS** | Tin tức theo ticker | ~5-15 headline/ticker/lần fetch |
-| **Google News RSS** | Tin tức bổ sung | ~10-20 headline/query |
-| **Tavily API** | Web search cho fact lookup | On-demand, 8 result/query |
+| `postgres` | PostgreSQL 16-alpine | 5432 (internal) |
+| `backend` | FastAPI + Uvicorn | 18000 (expose) |
+| `scheduler` | Python long-lived worker | no port |
+| `frontend` | Nginx + Vite build | 15173 (expose) |
+| `cloudflared` | Cloudflare Tunnel | public HTTPS URL |
 
-#### 4.1.2 Thống kê dataset (sau bulk ingest)
+---
 
-| Bảng | Số dòng (ước tính) | Ghi chú |
+## 4. Pipeline Text-to-SQL
+
+![Text2SQL Pipeline](docs/picture/text2sql.jpg)
+
+Text2SQL là path phức tạp nhất, được điều phối bằng **LangGraph StateGraph**. Toàn bộ logic chạy qua các node sau:
+
+### 4.1 Build SQL phase (4 node)
+
+| Node | Có gọi LLM? | Vai trò |
 |---|---|---|
-| `companies` | 100 | NASDAQ-100 |
-| `prices` | ~250,000 | 100 ticker × ~2,500 trading days |
-| `fundamentals` | ~100 | 1 snapshot/ticker (latest) |
-| `news_articles` | ~2,000 | Tuỳ thuộc tần suất sync |
-| `qa_examples` | Tăng dần | Cap 2,000 (prune theo use_count) |
-| `ingestion_runs` | Tăng dần | Audit log |
+| **Load Schema** | ❌ | Đọc schema text 6 bảng từ `schema.py` |
+| **Schema Cache** | ❌ | Decorator `@lru_cache` cache theo question hash |
+| **Knowledge Extractor** | ❌ | Regex tách tickers, time_window + dict glossary (MA20, drawdown, beta…) |
+| **Schema Selector** | ❌ | Keyword matching lọc bảng liên quan (giảm token vào LLM) |
 
-#### 4.1.3 Xử lý dữ liệu (ETL)
+→ Tất cả đều **rule-based**, không gọi LLM. Chạy trong vòng vài ms.
 
-```
-yfinance API ──► pandas DataFrame ──► Upsert PostgreSQL
-                       │                      │
-                       ▼                      ▼
-              ┌────────────────┐    ┌───────────────────┐
-              │ Schema mapping │    │ ON CONFLICT (UQ)  │
-              │ NaN → NULL     │    │ DO UPDATE SET ... │
-              │ Date parsing   │    │ idempotent re-run │
-              └────────────────┘    └───────────────────┘
-```
+### 4.2 SQL Generation + Execution
 
-- **Upsert idempotent** dùng `INSERT ... ON CONFLICT (company_id, date) DO UPDATE`.
-- **Scheduler near-realtime**: mỗi 10 phút, nếu market mở, refresh today's candle (yfinance trả về candle in-progress).
-- **Bulk historical**: chạy `python -m scripts.ingest_universe --period 10y --batch-size 5`, retry 3 lần với exponential backoff.
-
-### 4.2 Công nghệ sử dụng
-
-| Layer | Technology | Lý do chọn |
+| Node | Có gọi LLM? | Vai trò |
 |---|---|---|
-| **Frontend** | React 18, TypeScript, Vite, Recharts, lucide-react | Vite HMR nhanh, Recharts đủ cho line/bar/area, TS giúp type-safe API |
-| **Backend** | FastAPI 0.115+, Pydantic v2 | Async native, auto-generate OpenAPI docs, validation declarative |
-| **Pipeline** | LangGraph 0.2+ | StateGraph cho conditional routing (repair/retry), dễ debug từng node |
-| **SQL parser** | sqlglot 25+ | Hỗ trợ Postgres dialect, parse AST thật (chống regex bypass) |
-| **Database** | PostgreSQL 16-alpine | JSONB cho `embedding` & `tickers`, window functions cho deterministic SQL |
-| **ORM** | SQLAlchemy 2.0 | Declarative mapping, async-ready, migration-friendly |
-| **LLM** | OpenAI-compatible endpoint (llama.cpp / vLLM) | Chạy local, không phí API, dễ swap model |
-| **Data** | yfinance 0.2.40+, feedparser 6+, Tavily | yfinance miễn phí cho NASDAQ, Tavily cho fact-lookup |
-| **Deploy** | Docker Compose, Nginx, Cloudflare Tunnel | One-command deploy, tunnel cho demo công khai |
-| **Test** | pytest 8+ | 9 file test cover policy, sql_guard, intent, planner, visualization, follow-up |
+| **SQL Generator** | ✅ **LLM call #1** | Sinh 1 candidate SQL từ schema + knowledge + few-shot, max 600 tokens, temperature 0.2 |
+| **SQL Guard** | ❌ | Parse AST bằng `sqlglot`, chặn DDL/DML, whitelist 5 bảng, ép `LIMIT 5000` nếu thiếu |
+| **Execute SQL** | ❌ | Chạy SQL qua SQLAlchemy + psycopg, đọc/ghi PostgreSQL hai chiều |
 
-### 4.3 Phương pháp đánh giá
+### 4.3 Conditional Routing (Result diamond)
 
-#### 4.3.1 Đánh giá định lượng (Quantitative)
+Sau khi execute, `result_after_execute` rẽ 4 nhánh dựa trên trạng thái:
 
-Bộ test set thủ công gồm **120 câu hỏi tiếng Việt + 30 câu tiếng Anh**, phân bố:
-
-| Loại câu hỏi | Số lượng | Đánh giá bằng |
-|---|---|---|
-| Single-ticker price query | 25 | SQL chạy ra rows đúng schema |
-| Multi-ticker comparison | 20 | Có đủ N ticker trong result |
-| Year-over-year return | 15 | Số % khớp với công thức tay |
-| Drawdown / volatility | 10 | Khớp với pandas tính tay |
-| MA20/50/200 | 10 | Khớp với rolling mean |
-| Top N / ranking | 10 | Đúng thứ tự DESC |
-| News query | 10 | Trả về > 0 article, có link |
-| Company info | 10 | Có tên người đúng (manual check) |
-| Follow-up multi-turn | 20 | Resolve đúng ticker/window |
-| Out-of-scope (policy) | 20 | PolicyGuard chặn 100% |
-
-#### 4.3.2 Metric đánh giá
-
-```
-Intent Accuracy    = #(intent đúng) / #(total)
-Execution Rate     = #(SQL chạy không lỗi) / #(total SQL queries)
-Answer Correctness = #(answer khớp ground truth, manual judge) / #(total)
-Latency P50/P95    = percentile thời gian từ POST /chat → response
-Memory Hit Rate    = #(query có few-shot retrieved) / #(total LLM SQL queries)
-```
-
-### 4.4 Kết quả thực nghiệm
-
-> **Lưu ý:** Các số liệu dưới đây là **ước lượng dựa trên test set nội bộ** trong điều kiện LLM local (vd Qwen2.5-Coder-7B / GLM-4-9B chạy llama.cpp trên RTX 4060). Số liệu có thể khác trên model khác hoặc phần cứng khác.
-
-#### 4.4.1 Intent Router Accuracy (5 intent, LLM router)
-
-| Intent | Test cases | Đúng | Accuracy (ước lượng) |
-|---|---|---|---|
-| text_to_sql | 70 | 67 | ~95.7% |
-| visualization | 15 | 14 | ~93.3% |
-| web_search | 20 | 19 | ~95.0% |
-| ingestion | 5 | 5 | 100% |
-| general | 20 | 20 | 100% |
-| **Tổng** | **130** | **125** | **~96.2%** |
-
-LLM router cải thiện rõ rệt ở các case ngữ nghĩa:
-- "Apple làm ăn thế nào gần đây" → web_search ✓ (rule-based sai → text_to_sql)
-- "P/E là gì?" → general ✓ (rule-based sai vì có ticker giả "E")
-- "cho tôi biết tình hình Microsoft" → web_search ✓ (rule-based sai → text_to_sql)
-
-Các case còn sai chủ yếu khi câu hỏi rất mơ hồ ("xem AAPL" — không rõ user muốn data hay tin tức).
-
-#### 4.4.2 Text-to-SQL Performance (sau khi bỏ deterministic matcher)
-
-| Path | % match (ước lượng) | Latency P50 | Latency P95 |
-|---|---|---|---|
-| LLM candidate (best case, 2 LLM call) | ~70% | ~3.5s | ~7.5s |
-| LLM candidate + repair_empty (1 retry) | ~18% | ~5.8s | ~10s |
-| LLM candidate + repair_error (2 retry) | ~9% | ~7.2s | ~13s |
-| Fail (LLM down hoặc exhausted retry) | ~3% | ~1s (early fail) | ~9s |
-
-**Execution Rate** (SQL chạy không lỗi): ~95% sau khi qua repair node.
-
-> **Lưu ý**: Sau commit `a5e2228`, deterministic SQL matcher (32 builder) đã bị retire. Mọi câu hỏi đi qua LLM pipeline đầy đủ. Latency tăng nhưng linh hoạt hơn với pattern phức tạp.
-
-**Answer Correctness** (manual judge, 50 câu mẫu): ~88% — sai chủ yếu ở câu hỏi mơ hồ (vd "cổ phiếu nào tăng tốt" — không có định nghĩa "tốt").
-
-#### 4.4.3 Few-shot Memory Effect
-
-So sánh trước vs sau khi có memory (qa_examples tích lũy ~150 example):
-
-| Metric | Không memory | Có memory (150 examples) |
-|---|---|---|
-| LLM SQL accuracy (subset 30 câu) | ~76% | ~84% (ước lượng) |
-| Average tokens/prompt | ~1,200 | ~1,800 (do thêm few-shot block) |
-| Repair-rate (cần retry) | ~14% | ~8% (ước lượng) |
-
-Memory hit rate phụ thuộc vào diversity của câu hỏi user — trong demo nội bộ đạt ~40-50% sau 1 tuần dùng.
-
-#### 4.4.4 Safety / Security
-
-| Test | Result |
+| Điều kiện | Đi đến |
 |---|---|
-| SQL Injection attempts (50 case) | 100% chặn (sqlglot reject hoặc whitelist filter) |
-| DDL/DML injection (`DROP`, `UPDATE`, `DELETE`) | 100% chặn |
-| Multi-statement (`; DROP TABLE`) | 100% chặn |
-| Out-of-scope table access | 100% chặn |
-| Policy-violating questions (chính trị, code injection prompt) | 100% chặn bởi PolicyGuard |
+| `success: rows > 0` | → Explainer |
+| `fail SQL error, attempt < 2` | → Repair Agent |
+| `empty 0 rows, attempt < 1` | → Repair Agent |
+| `LLM unavailable / attempt ≥ 99` | → Fail Handler |
 
-#### 4.4.5 End-to-end Latency
+### 4.4 Terminal Nodes
 
-Đo trên VPS 4 vCPU / 8GB RAM với LLM local 7B model:
+| Node | Có gọi LLM? | Vai trò |
+|---|---|---|
+| **Repair Agent** | ✅ **LLM call #2** | Khi candidate đầu fail, sinh **3 candidate đa dạng** (window function / CTE / aggregation), retry tối đa 2 lần |
+| **Explainer** | ⚠️ **LLM stream** (đôi khi) | Ưu tiên 12+ deterministic VN formatter (instant); fallback LLM stream khi pattern không match |
+| **Fail Handler** | ❌ | Trả message tiếng Việt cụ thể (LLM unavailable / exhausted / generic), không leak stack trace |
 
-| Intent | P50 | P95 | Composition |
+### 4.5 Repair Loop
+
+- `Repair Agent → Execute SQL` (retry tối đa 2 lần, "fan out 3 candidate")
+- `Repair Agent → Fail Handler` (khi chính repair gặp LLMError)
+
+### 4.6 LLM Call Budget
+
+| Scenario | Số LLM call |
+|---|---|
+| **Best case** | 2 calls — Intent Router (Backend) + SQL Generator |
+| **Common case** | 3 calls — Intent Router + SQL Generator + Explainer stream |
+| **Worst case** | 5 calls — Intent Router + SQL Generator + Repair (×2) + Explainer stream |
+
+### 4.7 Có bao nhiêu agent trong hệ thống?
+
+**Theo định nghĩa chặt** (true agent có feedback loop, tự ra quyết định, có thể retry):
+
+→ **Chỉ 1 agent duy nhất**: `Repair Agent`
+
+Vì nó là component duy nhất có:
+- Nhận feedback (SQL error / empty result)
+- Tự quyết định cách sửa SQL
+- Có thể loop ngược về Execute SQL retry (max 2 lần)
+
+**Theo định nghĩa lỏng** (mọi component gọi LLM): 6 component LLM-powered (Intent Router + SQL Generator + Repair Agent + Explainer + WebSearch summarizer + General chat).
+
+Đây là **LLM-powered pipeline với 1 true agent**, không phải multi-agent system.
+
+---
+
+## 5. Tính năng nổi bật
+
+| # | Tính năng | Mô tả |
+|---|---|---|
+| 1 | **Hỏi đáp dữ liệu chứng khoán** | Truy vấn giá, volume, market cap, P/E, beta, return, drawdown… của 101 mã NASDAQ-100 |
+| 2 | **5 intent path tự động phân loại** | LLM router phân câu hỏi vào: text_to_sql, visualization, web_search, ingestion, general |
+| 3 | **Vẽ biểu đồ tự động** | Line/bar/scatter dựa trên schema kết quả, hỗ trợ multi-ticker comparison |
+| 4 | **Web search cho fact ngoài DB** | Tavily search + LLM tóm tắt tiếng Việt cho CEO, founder, tin tức, headquarters |
+| 5 | **General LLM chat** | Trả lời câu hỏi kiến thức tài chính phổ thông (P/E là gì, Warren Buffett là ai) |
+| 6 | **Multi-turn follow-up** | Hỗ trợ "còn TSLA thì sao", "cùng khoảng thời gian đó", "2 năm này" |
+| 7 | **Cross-session memory** | Học từ Q→SQL đã thành công qua feature-hash embedding 256-d, retrieve few-shot top-3 |
+| 8 | **SSE streaming response** | Text trả lời chạy word-by-word như ChatGPT, không phải đợi full payload |
+| 9 | **Auto-refresh near real-time** | Scheduler container cron 10 phút trong giờ NASDAQ, gọi /ingest tự cập nhật |
+| 10 | **Cloudflare Tunnel public demo** | Có thể expose hệ thống ra public URL HTTPS không cần SSL setup |
+| 11 | **SQL Guard chống injection** | sqlglot parse AST, whitelist 5 bảng, chặn DDL/DML, auto-LIMIT |
+| 12 | **Thinking Trace trực quan** | Hiển thị từng bước pipeline đang chạy (Load Schema → Cache → Knowledge → Selector → Generator…) |
+| 13 | **Sidebar tickers + memory inspector** | Quản lý 102 mã đã ingest, xem/xóa các cặp Q→SQL đã học |
+| 14 | **Dark/light theme + SQL formatter** | Theme tùy chỉnh, SQL pretty-print bằng `sql-formatter` |
+| 15 | **Docker Compose đầy đủ** | 5 service đóng gói: postgres + backend + scheduler + frontend + cloudflared |
+
+---
+
+## 6. Công nghệ sử dụng
+
+### Backend
+
+| Tầng | Công nghệ | Phiên bản | Vai trò |
 |---|---|---|---|
-| `general` (LLM conversational) | ~1.2s | ~2.5s | Router (500ms) + LLM persona (800ms-2s) |
-| `text_to_sql` | ~4.0s | ~7.5s | Router + Planner + SQL gen + Execute + Explain |
-| `visualization` | ~4.3s | ~8s | text_to_sql + Chart Inferencer |
-| `web_search` | ~3s | ~5s | Router + Tavily (1-2s) + LLM summary |
-| `ingestion` (3 ticker, 1y) | ~6s | ~12s | yfinance fetch + DB upsert |
+| Framework | FastAPI + Uvicorn | 0.115+ | HTTP API, async I/O, SSE streaming |
+| Pipeline orchestrator | LangGraph | 0.2+ | StateGraph cho Text-to-SQL repair loop |
+| SQL validator | sqlglot | 25+ | Parse AST, validate read-only, ép LIMIT |
+| ORM | SQLAlchemy + psycopg | 2.0+ / 3.x | Kết nối Postgres, upsert idempotent |
+| HTTP client | httpx | 0.27+ | Gọi LLM endpoint + Tavily + RSS, hỗ trợ SSE |
+| Schema validation | Pydantic v2 | 2.x | Request/response model |
+| Database | PostgreSQL | 16-alpine | Lưu prices, fundamentals, qa_examples |
+| LLM | OpenAI-compatible local endpoint | cx/gpt-5.4 | Sinh SQL + tóm tắt tiếng Việt |
+| Web search | Tavily Search API | v1 | Tra cứu fact ngoài schema |
+| Data source | yfinance | 0.2+ | Lấy giá, fundamentals |
+| Python | 3.11+ | | |
 
-Mọi intent giờ đều có overhead ~500ms cho LLM router. Nếu LLM down, fallback rule-based cắt overhead này về <1ms.
+### Frontend
 
-### 4.5 Hạn chế quan sát được
+| Tầng | Công nghệ | Phiên bản | Vai trò |
+|---|---|---|---|
+| Framework | React + TypeScript | 18+ | SPA chat UI |
+| Build tool | Vite | 5.x | Bundler nhanh |
+| Charting | Recharts | 2.x | Line/bar/scatter chart |
+| SQL formatter | sql-formatter (npm) | 15+ | Pretty-print SQL trong chat |
+| Icons | lucide-react | latest | Icon set |
+| Style | CSS variables | — | Light/dark theme |
 
-1. LLM local 7B đôi khi sinh SQL có column không tồn tại (hallucination). Mitigation: schema selector + repair node + few-shot memory.
-2. Câu hỏi tiếng Việt có dấu / không dấu lẫn lộn đôi khi làm intent router bối rối. Đã giải quyết phần lớn bằng `_normalize_text()` strip dấu, nhưng case edge vẫn còn.
-3. Tavily API có rate limit free tier (1000 req/tháng) — cần caching trong production.
-4. Scheduler dùng UTC union cho market hours, có thể refresh ngoài giờ thật khi DST chuyển đổi.
-5. In-memory session state → restart backend = mất context. Production cần Redis.
+### DevOps
+
+| Tầng | Công nghệ | Vai trò |
+|---|---|---|
+| Container | Docker Compose | Đóng gói 5 service |
+| Reverse proxy | Nginx (frontend) | Serve SPA + proxy `/api/*` tới backend |
+| Public tunnel | Cloudflare Tunnel (cloudflared) | Expose demo qua public HTTPS URL |
+| CI/CD | GitHub Actions (tùy chọn) | Build + test pipeline |
 
 ---
 
-## 5. Cài đặt & Chạy thử
+## 7. Cài đặt và chạy thử
 
-### 5.1 Yêu cầu
+### 7.1 Yêu cầu
 
-- Docker + Docker Compose
-- LLM server OpenAI-compatible chạy trên host (vd `llama.cpp` listen `:20128`) — hoặc dùng OpenAI API key
-- (Tuỳ chọn) Tavily API key cho intent `web_search` (CEO, founder, website, tin tức)
+- **Docker** + **Docker Compose** v2+
+- **LLM endpoint OpenAI-compatible** (vd `llama.cpp` server listening `:20128`, hoặc OpenAI API key)
+- **Tavily API key** — đăng ký miễn phí tại https://app.tavily.com/home (1000 search/tháng free tier)
+- **(Tùy chọn)** Cloudflare Tunnel token nếu muốn expose public URL
 
-### 5.2 Chạy nhanh
+### 7.2 Quick start (5 bước)
 
 ```bash
+# 1. Clone repository
+git clone <repo-url> fintextsql && cd fintextsql
+
+# 2. Cấu hình environment
 cp .env.example .env
-# Sửa .env: LLM_API_KEY, LLM_MODEL, (optional) TAVILY_API_KEY
+# Edit .env:
+#   - LLM_API_KEY, LLM_BASE_URL (endpoint LLM)
+#   - TAVILY_API_KEY (key Tavily)
+#   - CLOUDFLARE_TUNNEL_TOKEN (optional)
 
+# 3. Khởi động stack 5 service
 docker compose up -d --build
+
+# 4. Ingest dữ liệu NASDAQ-100 (10 năm history)
+# Mất ~10 phút cho 100 mã
+python3 -m scripts.ingest_universe \
+    --base-url http://localhost:18000 \
+    --period 10y \
+    --batch-size 5
+
+# 5. Truy cập UI
+open http://localhost:15173
 ```
 
-Mở:
-- Frontend: http://localhost:15173
-- Backend API: http://localhost:18000/docs
-
-### 5.3 Nạp dữ liệu NASDAQ-100
-
-```bash
-docker compose exec backend python -m scripts.ingest_universe \
-    --base-url http://localhost:8000 \
-    --period 10y --batch-size 5
-```
-
-Mất ~30-60 phút cho 100 ticker × 10 năm tuỳ tốc độ mạng.
-
-### 5.4 Ví dụ câu hỏi để demo
+### 7.3 Câu hỏi mẫu test 5 intent
 
 ```
-Top 5 ticker có market cap cao nhất
-% tăng giảm của AAPL và MSFT trong 30 ngày gần nhất
-Vẽ chart so sánh giá đóng cửa AAPL, MSFT, NVDA trong 60 ngày
-Có tin gì mới về Apple không?
-CEO hiện tại của NVIDIA là ai?
-Drawdown lớn nhất của TSLA năm 2024
-So sánh MA20 và MA50 của AAPL
-[follow-up] còn TSLA thì sao
-[follow-up] cùng khoảng thời gian đó
+text_to_sql:    Giá đóng cửa cao nhất của AAPL trong năm 2024 là bao nhiêu?
+visualization:  Vẽ chart giá đóng cửa của AAPL và MSFT trong 60 ngày qua
+web_search:     CEO của Apple hiện tại là ai?
+ingestion:      Ingest dữ liệu mới cho NVDA
+general:        P/E ratio là gì? Cách tính như thế nào?
+multi_turn:     [Câu 1] So sánh AAPL và MSFT 30 ngày qua
+                [Câu 2] còn TSLA thì sao
 ```
+
+### 7.4 API endpoints
+
+| Endpoint | Method | Mô tả |
+|---|---|---|
+| `/health` | GET | Liveness probe |
+| `/chat` | POST | Chat non-streaming (trả full JSON) |
+| `/chat/stream` | POST | Chat SSE streaming token-by-token |
+| `/chat/route` | POST | Preview intent + tickers, không execute |
+| `/ingest` | POST | Manual trigger sync yfinance |
+| `/companies` | GET | Danh sách 102 mã đã ingest |
+| `/memory` | GET | List qa_examples đã học |
+| `/memory/{id}` | DELETE | Xóa 1 example |
 
 ---
 
-## 6. Kết luận
-
-### 6.1 Kết quả đạt được
-
-- ✅ Xây dựng thành công hệ thống Text-to-SQL tài chính chạy hoàn chỉnh, hỗ trợ **5 intent** rõ ràng (text_to_sql, visualization, web_search, ingestion, general).
-- ✅ Đạt **~96% accuracy intent router** (LLM-classified) và **~95% SQL execution rate** trên test set nội bộ 130 câu.
-- ✅ Pipeline LangGraph **thuần LLM** với repair loop tự động → ~70% câu trả lời đúng ngay candidate đầu, ~97% câu có câu trả lời sau tối đa 2 retry.
-- ✅ **SQL Guard với sqlglot** chặn 100% các attempt injection / DDL / DML trên test set.
-- ✅ **Cross-session memory** hoạt động, cải thiện accuracy ước lượng ~8 điểm % với 150 example tích lũy.
-- ✅ Triển khai full stack qua Docker Compose, có **scheduler near-realtime** refresh dữ liệu khi market mở.
-- ✅ Tích hợp **Tavily web search** cho câu hỏi tra cứu fact ngoài DB schema (CEO, founder, tin tức), có time-aware prompt chống hallucination về sự kiện tương lai.
-- ✅ **`general` path LLM-powered** trả lời câu hỏi kiến thức tài chính phổ thông (P/E là gì, drawdown nghĩa là gì, Warren Buffett là ai...).
-
-### 6.2 Đóng góp chính
-
-1. **Multi-path agent architecture** chia rõ "data ở đâu" (Postgres / yfinance / web) → tránh ép LLM sinh SQL cho fact không có trong schema.
-2. **LLM-first intent routing với rule-based fallback** — bắt được ngữ nghĩa khó như "Apple làm ăn thế nào gần đây" → web_search; khi LLM down vẫn dùng được nhờ rule fallback.
-3. **Feature-hash few-shot memory** — không cần pgvector / external embedding model, đủ tốt cho domain SQL có schema cố định.
-4. **Follow-up resolution** xử lý 5 case chính của câu hỏi đa lượt tiếng Việt.
-
-### 6.3 Hướng phát triển tương lai
-
-1. **Authentication + Rate limiting**: thêm JWT/API key, per-IP rate limit để chuẩn bị production.
-2. **Persistent session** với Redis để horizontal scale.
-3. **Refactor `text2sql/service.py`** (3355 dòng) thành các module nhỏ hơn theo concern (`deterministic_sql/`, `explainers/`, `repair/`).
-4. **Mở rộng universe** ra S&P 500 và HOSE (chứng khoán Việt Nam) qua VnDirect / SSI API.
-5. **Fine-tune LLM** trên qa_examples đã tích lũy để giảm dependency vào prompt engineering.
-6. **Vector embedding chuẩn** (vd `bge-m3` qua Ollama) thay feature-hash khi corpus đủ lớn.
-7. **Frontend refactor**: tách `App.tsx` 1452 dòng thành component theo concern.
-8. **Observability**: thêm Sentry + Prometheus metrics cho LLM latency, intent accuracy production.
-
-### 6.4 Bài học kinh nghiệm
-
-- **LLM không phải bạc đạn**: với metric tài chính có công thức rõ, deterministic SQL thắng cả về tốc độ lẫn độ chính xác.
-- **Heuristic router đủ tốt** cho 7 intent — không cần LLM-based router thêm phức tạp + chi phí.
-- **AST-based SQL guard** (sqlglot) là phải có; regex-based guard có thể bị bypass.
-- **Cross-session memory** không cần fancy embedding — feature-hash 256-dim đã đủ cho domain hẹp.
-- **Session state in-memory** OK cho demo, nhưng production phải có persistent store.
-
----
-
-## 7. Tham khảo
-
-- LangGraph documentation: https://langchain-ai.github.io/langgraph/
-- sqlglot: https://github.com/tobymao/sqlglot
-- yfinance: https://github.com/ranaroussi/yfinance
-- Tavily Search API: https://docs.tavily.com/
-- OpenAI Chat Completions API spec: https://platform.openai.com/docs/api-reference/chat
-- FastAPI: https://fastapi.tiangolo.com/
-- Recharts: https://recharts.org/
-
----
-
-## 8. Phụ lục — Cấu trúc thư mục
+## 8. Cấu trúc dự án
 
 ```
 DP/
-├── ARCHITECTURE.md              # Tài liệu kiến trúc chi tiết
-├── README.md                    # File này
-├── docker-compose.yml           # 5 service: postgres, backend, scheduler, frontend, cloudflared
-├── pyproject.toml               # Python deps + setuptools config
-├── .env.example                 # Template biến môi trường
-├── src/fintextsql/              # Backend Python
-│   ├── api/                     # FastAPI app + Pydantic schemas
-│   ├── core/                    # Intent router, planner, policy, config, tickers
-│   ├── db/                      # SQLAlchemy models + session
-│   ├── text2sql/                # LangGraph pipeline (service.py 3355 dòng)
-│   │   ├── service.py           # Main pipeline + ~32 deterministic builders
-│   │   ├── schema.py            # Schema text + table selector
-│   │   ├── sql_guard.py         # sqlglot validate, whitelist tables
-│   │   ├── knowledge.py         # Extract ticker, time, glossary
-│   │   └── few_shot.py          # Cross-session memory (feature-hash)
-│   ├── llm/                     # OpenAI-compatible client
-│   ├── ingestion/               # yfinance ETL
-│   └── paths/
-│       ├── visualization/       # Chart spec inference
-│       ├── news/                # RSS + LLM analysis
-│       ├── simple_finance/      # yfinance fast_info
-│       └── company_info/        # Tavily web search
-├── scripts/                     # Operations layer
-│   ├── universe.py              # NASDAQ-100 list
-│   ├── ingest_universe.py       # Bulk historical CLI
-│   └── scheduler.py             # Near-realtime worker
-├── frontend/src/                # React/Vite SPA
-│   ├── App.tsx                  # Main SPA (1452 dòng)
-│   ├── main.tsx                 # Vite entry
-│   └── styles.css               # Global styles
-├── tests/                       # pytest (9 file)
-│   ├── test_intent_router.py
-│   ├── test_agent_planner.py
-│   ├── test_policy_guard.py
-│   ├── test_sql_guard.py
-│   ├── test_text2sql_explanation.py
-│   ├── test_visualization.py
-│   ├── test_news_formatting.py
-│   ├── test_chat_context.py
-│   └── test_follow_up.py
-└── docs/                        # Tài liệu bổ sung (báo cáo PDF, slide demo...)
+├── docker-compose.yml            # 5 service: postgres, backend, scheduler, frontend, cloudflared
+├── .env / .env.example           # DB URL, LLM key, Tavily key, Cloudflare token
+├── backend/Dockerfile            # Image Python 3.11
+├── pyproject.toml                # Dependencies: fastapi, langgraph, sqlglot, sqlalchemy
+│
+├── src/fintextsql/
+│   ├── api/
+│   │   ├── main.py               # FastAPI app + /chat + /chat/stream + /ingest
+│   │   └── schemas.py            # Pydantic models, IntentName Literal
+│   │
+│   ├── core/
+│   │   ├── intent.py             # RuleBasedRouter (fallback)
+│   │   ├── llm_router.py         # LLMIntentRouter (default, phân loại 5 intent)
+│   │   ├── planner.py            # TaskPlanner + follow-up rewrite
+│   │   ├── policy.py             # PolicyGuard (unsafe SQL, prediction)
+│   │   ├── tickers.py            # Ticker extraction tiếng Việt/Anh
+│   │   └── config.py             # Pydantic Settings (env vars)
+│   │
+│   ├── text2sql/
+│   │   ├── service.py            # LangGraph pipeline (build_sql → execute → explain/repair/fail)
+│   │   ├── schema.py             # Schema selector + @lru_cache
+│   │   ├── knowledge.py          # Knowledge extractor (glossary, time window)
+│   │   ├── sql_guard.py          # sqlglot validator
+│   │   └── few_shot.py           # qa_examples + feature-hash retrieval
+│   │
+│   ├── paths/
+│   │   ├── visualization/        # Chart inferencer + Recharts spec
+│   │   ├── web_search/           # Tavily + LLM summary
+│   │   └── general/              # LLM conversational FinTextSQL persona
+│   │
+│   ├── ingestion/yfinance_service.py
+│   │
+│   ├── llm/client.py             # httpx wrapper, chat() + chat_stream() SSE
+│   │
+│   └── db/
+│       ├── models.py             # SQLAlchemy: Company, Price, Fundamental, QAExample
+│       └── session.py
+│
+├── scripts/
+│   ├── universe.py               # 100 mã NASDAQ-100
+│   ├── ingest_universe.py        # Bulk historical ingest (period=10y)
+│   └── scheduler.py              # Long-lived cron worker (10 phút giờ NASDAQ)
+│
+├── frontend/
+│   ├── src/App.tsx               # React chat UI + SSE consumer (1500+ dòng)
+│   ├── src/styles.css            # CSS variables, light/dark theme
+│   ├── nginx.conf                # Reverse proxy /api/* (timeout 300s)
+│   └── vite.config.ts
+│
+├── docs/
+│   ├── picture/
+│   │   ├── architecture.jpg     # Sơ đồ kiến trúc tổng quan
+│   │   ├── text2sql.jpg          # Sơ đồ Text2SQL pipeline
+│   │   ├── 01_home.png           # Screenshot trang chủ
+│   │   ├── 02_text_to_sql.png    # Screenshot Text2SQL trace
+│   │   ├── 02_web_search.png     # Screenshot Web Search trace
+│   │   ├── 02_multi_turn_*.png   # Screenshot multi-turn
+│   │   └── 03_visualization.png  # Screenshot chart
+│   └── Text2sql_report.docx      # Báo cáo đồ án
+│
+└── tests/                        # Pytest test cases
+    └── test_*.py
 ```
 
 ---
 
-**Liên hệ:** `<Email nhóm hoặc team lead>`
-**Repository:** `<URL repo nếu public>`
+## 9. Hạn chế và hướng phát triển
+
+### 9.1 Hạn chế hiện tại
+
+1. **Phụ thuộc LLM endpoint** — toàn pipeline cần LLM. Khi LLM down, system fail nhanh với message rõ ràng nhưng không trả lời được. Rule-based router là fallback nhưng chỉ phân loại được intent, không sinh được SQL.
+
+2. **Chỉ NASDAQ-100** — universe cố định 101 mã. Để mở rộng cần thay đổi `scripts/universe.py` + re-ingest.
+
+3. **Chỉ daily bar** — không có intraday data. Câu hỏi *"giá AAPL lúc 10h sáng"* không trả lời được.
+
+4. **In-memory session state** — restart backend = mất context multi-turn. Production cần Redis hoặc DB-backed session.
+
+5. **Cross-session memory dùng feature-hash** — đơn giản, không cần model embedding nặng, nhưng có thể bỏ sót case rephrase ngữ nghĩa tương đồng. Production nên dùng sentence-transformer (bge-small, multilingual-e5).
+
+6. **Chưa có auth + rate limit** — endpoint công khai, cần JWT middleware trước khi deploy production.
+
+7. **Frontend monolith** — `App.tsx` 1500+ dòng, cần tách component theo concern (Sidebar, Chat, MessageList, Composer, Memory modal).
+
+8. **Tavily free tier giới hạn 1000 search/tháng** — đủ cho demo, production cần upgrade hoặc cache results.
+
+### 9.2 Hướng phát triển
+
+- **Intraday data** — thêm bảng `prices_intraday` lưu bar 1m/5m/15m
+- **Sentence-transformer embedding** — thay feature-hash bằng bge-small / multilingual-e5 cho retrieval ngữ nghĩa
+- **Fine-tune local model** — Qwen 7B / Llama 3 8B trên 5k cặp (Q, SQL) → chạy 100% local, không phụ thuộc OpenAI-compat endpoint
+- **Multi-database support** — HOSE, HNX, UPCOM cho thị trường Việt Nam
+- **Forecasting path** — Prophet/ARIMA cho dự báo giá ngắn hạn (có disclaimer rõ ràng)
+- **JWT auth + Redis session + caching layer** — production hardening
+- **Performance tester (k6)** — load test + soak test trước go-live
+- **Monitoring** — Prometheus + Grafana cho metrics, Sentry cho error tracking
+- **Export CSV/Excel/PDF** — bảng kết quả có thể export, share permalink
+
+---
+
+## 10. Tham khảo
+
+### Papers & Benchmarks
+
+- Yu, T. et al. (2018). *Spider: A Large-Scale Human-Labeled Dataset for Text-to-SQL.* EMNLP.
+- Li, J. et al. (2023). *Can LLM Already Serve as A Database Interface? BIRD Benchmark.* NeurIPS.
+- Pourreza, M. & Rafiei, D. (2023). *DIN-SQL: Decomposed In-Context Learning of Text-to-SQL.* NeurIPS.
+- Gao, D. et al. (2023). *Text-to-SQL Empowered by Large Language Models: A Benchmark Evaluation.* arXiv:2308.15363.
+
+### Tools & Libraries
+
+- **LangGraph** — https://langchain-ai.github.io/langgraph/
+- **SQLGlot** — https://github.com/tobymao/sqlglot
+- **FastAPI** — https://fastapi.tiangolo.com/
+- **PostgreSQL 16** — https://www.postgresql.org/docs/16/
+- **Tavily Search API** — https://docs.tavily.com/
+- **yfinance** — https://github.com/ranaroussi/yfinance
+- **Recharts** — https://recharts.org/
+- **Pydantic v2** — https://docs.pydantic.dev/
+
+### Inspirations
+
+- **ChatGPT UX** — streaming response, sidebar conversations
+- **Vanna AI** — Text-to-SQL with retrieval-augmented few-shot
+- **Cursor / Cody** — IDE-integrated AI assistants với context awareness
+
+---
+
+<p align="center">
+  <i>Built with ❤️ by FinTextSQL team — 2026</i>
+</p>
