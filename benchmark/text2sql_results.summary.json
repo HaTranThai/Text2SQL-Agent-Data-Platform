@@ -1,0 +1,25 @@
+{
+  "total": 60,
+  "sql_generation_rate": 1.0,
+  "sql_execution_rate": 1.0,
+  "result_match_rate": 0.8,
+  "per_difficulty": {
+    "easy": {
+      "total": 22,
+      "matched": 21
+    },
+    "medium": {
+      "total": 23,
+      "matched": 17
+    },
+    "hard": {
+      "total": 15,
+      "matched": 10
+    }
+  },
+  "latency_ms": {
+    "mean": 11202.486875077011,
+    "median": 9665.363250474911,
+    "p95": 24306.20387394447
+  }
+}
